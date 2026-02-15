@@ -5,7 +5,7 @@ A lightweight distributed email sending agent for Email Loop.
 ## Quick Start (One-Line Install)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/install.sh | bash
 ```
 
 This will:
