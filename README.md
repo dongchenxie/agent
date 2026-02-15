@@ -37,6 +37,11 @@ cp .env.example .env
 | `MASTER_URL` | URL of the Email Loop master server | `http://localhost:3000` |
 | `AGENT_SECRET` | Shared secret for registration | Required |
 | `AGENT_NICKNAME` | Unique name for this agent | `agent-{timestamp}` |
+| `POLL_INTERVAL` | How often to poll for tasks (ms) | `60000` (1 minute) |
+| `SEND_INTERVAL` | Delay between sending emails (ms) | `2000` (2 seconds) |
+| `BATCH_SIZE` | Number of emails to fetch per poll | `10` |
+
+**Note:** These polling/sending parameters can also be configured dynamically from the master server's UI. The agent will automatically pick up new settings on the next poll.
 
 ## Usage
 

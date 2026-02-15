@@ -17,9 +17,9 @@ const AGENT_NICKNAME = process.env.AGENT_NICKNAME || `agent-${Date.now()}`;
 // Runtime state
 let agentToken: string | null = null;
 let config = {
-    pollInterval: 60000,  // 1 minute
-    sendInterval: 2000,   // 2 seconds
-    batchSize: 10
+    pollInterval: parseInt(process.env.POLL_INTERVAL || '60000'),  // Default: 1 minute
+    sendInterval: parseInt(process.env.SEND_INTERVAL || '2000'),   // Default: 2 seconds
+    batchSize: parseInt(process.env.BATCH_SIZE || '10')            // Default: 10
 };
 
 interface Task {
