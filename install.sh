@@ -145,7 +145,7 @@ REPO_URL="https://github.com/dongchenxie/agent.git"
 
 if [ -d "$INSTALL_DIR" ]; then
     print_info "Directory $INSTALL_DIR already exists"
-    read -p "Do you want to overwrite it? (y/N): " -n 1 -r
+    read -p "Do you want to overwrite it? (y/N): " -n 1 -r < /dev/tty
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"
@@ -181,22 +181,22 @@ print_info "Please provide the following configuration:"
 echo ""
 
 # Master URL
-read -p "Master Server URL (e.g., https://your-server.com:9988): " MASTER_URL
+read -p "Master Server URL (e.g., https://your-server.com:9988): " MASTER_URL < /dev/tty
 while [ -z "$MASTER_URL" ]; do
     print_error "Master URL cannot be empty"
-    read -p "Master Server URL: " MASTER_URL
+    read -p "Master Server URL: " MASTER_URL < /dev/tty
 done
 
 # Agent Secret
-read -p "Agent Secret (from server .env): " AGENT_SECRET
+read -p "Agent Secret (from server .env): " AGENT_SECRET < /dev/tty
 while [ -z "$AGENT_SECRET" ]; do
     print_error "Agent Secret cannot be empty"
-    read -p "Agent Secret: " AGENT_SECRET
+    read -p "Agent Secret: " AGENT_SECRET < /dev/tty
 done
 
 # Agent Nickname
 DEFAULT_NICKNAME="agent-$(hostname)-$(date +%s)"
-read -p "Agent Nickname (default: $DEFAULT_NICKNAME): " AGENT_NICKNAME
+read -p "Agent Nickname (default: $DEFAULT_NICKNAME): " AGENT_NICKNAME < /dev/tty
 AGENT_NICKNAME=${AGENT_NICKNAME:-$DEFAULT_NICKNAME}
 
 # Create .env file
@@ -213,7 +213,7 @@ print_success "Configuration saved to .env"
 if [ "$OS" == "linux" ]; then
     print_header "Step 5: Setting up systemd service"
 
-    read -p "Do you want to set up auto-restart with systemd? (Y/n): " -n 1 -r
+    read -p "Do you want to set up auto-restart with systemd? (Y/n): " -n 1 -r < /dev/tty
     echo
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         SERVICE_NAME="email-loop-agent"
@@ -247,7 +247,7 @@ EOF
         print_success "Systemd service created: $SERVICE_NAME"
         print_info "Service will auto-restart on failure"
 
-        read -p "Do you want to start the service now? (Y/n): " -n 1 -r
+        read -p "Do you want to start the service now? (Y/n): " -n 1 -r < /dev/tty
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             sudo systemctl start "$SERVICE_NAME"
@@ -268,7 +268,7 @@ else
     # macOS - use launchd
     print_header "Step 5: Setting up launchd service"
 
-    read -p "Do you want to set up auto-restart with launchd? (Y/n): " -n 1 -r
+    read -p "Do you want to set up auto-restart with launchd? (Y/n): " -n 1 -r < /dev/tty
     echo
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         PLIST_NAME="com.emailloop.agent"
