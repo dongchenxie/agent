@@ -3,7 +3,7 @@
 #############################################
 # Email Loop Agent - Uninstaller
 #############################################
-# Usage: curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/master/uninstall.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/uninstall.sh | bash
 #############################################
 
 set -e

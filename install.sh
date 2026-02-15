@@ -3,7 +3,7 @@
 #############################################
 # Email Loop Agent - One-Click Installer
 #############################################
-# Usage: curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/install.sh | bash
 #############################################
 
 set -e
