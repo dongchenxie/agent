@@ -1,6 +1,6 @@
 {
   "name": "email-loop-agent",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Distributed email sending agent for Email Loop",
   "main": "index.ts",
   "scripts": {
