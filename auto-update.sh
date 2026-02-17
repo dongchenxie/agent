@@ -99,23 +99,9 @@ fi
 
 log_success "Dependencies installed"
 
-# Restart service if systemd is available
-if command -v systemctl &> /dev/null; then
-    log_info "Restarting systemd service..."
-    sudo systemctl restart "$SERVICE_NAME" 2>&1 | tee -a "$LOG_FILE"
-
-    if [ $? -eq 0 ]; then
-        log_success "Service restarted successfully"
-        log_success "Update completed! New version: $REMOTE_COMMIT"
-    else
-        log_error "Failed to restart service"
-        log_info "Please restart manually: sudo systemctl restart $SERVICE_NAME"
-        exit 1
-    fi
-else
-    log_info "systemd not available, please restart the agent manually"
-    log_success "Update completed! New version: $REMOTE_COMMIT"
-fi
+# Update completed - the agent process will exit and systemd will restart it automatically
+log_success "Update completed! New version: $REMOTE_COMMIT"
+log_info "Agent will exit and systemd will restart automatically"
 
 # Clean up old logs (keep last 100 lines)
 if [ -f "$LOG_FILE" ]; then

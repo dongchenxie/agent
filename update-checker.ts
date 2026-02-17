@@ -179,7 +179,9 @@ export class UpdateChecker {
       console.log('[UpdateChecker] Service will restart automatically');
 
       // The service will be restarted by the update script
-      // This process will be terminated
+      // Exit this process to let the new one take over
+      console.log('[UpdateChecker] Exiting old process...');
+      process.exit(0);
     } catch (error) {
       console.error('[UpdateChecker] Error performing update:', error);
       console.log('[UpdateChecker] Please update manually: ./auto-update.sh');
