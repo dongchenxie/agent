@@ -27,6 +27,7 @@ let config = {
 // Queue management
 let currentQueue: Task[] = [];
 let isPollingEnabled = true;
+let isShuttingDown = false;
 
 /**
  * Get current queue size
@@ -41,6 +42,39 @@ function getQueueSize(): number {
 function stopPolling(): void {
     isPollingEnabled = false;
     console.log('[Agent] Polling stopped - no new tasks will be fetched');
+}
+
+/**
+ * Graceful shutdown handler
+ */
+async function gracefulShutdown(signal: string): Promise<void> {
+    if (isShuttingDown) {
+        console.log('[Agent] Shutdown already in progress...');
+        return;
+    }
+
+    console.log(`\n[Agent] Received ${signal} - initiating graceful shutdown...`);
+    isShuttingDown = true;
+
+    // Stop accepting new tasks
+    stopPolling();
+
+    // Wait for queue to be empty
+    if (currentQueue.length > 0) {
+        console.log(`[Agent] Waiting for ${currentQueue.length} email(s) to be sent...`);
+
+        while (currentQueue.length > 0) {
+            console.log(`[Agent] Queue size: ${currentQueue.length} - still processing...`);
+            await sleep(1000);
+        }
+
+        console.log('[Agent] All emails sent successfully');
+    } else {
+        console.log('[Agent] No pending emails in queue');
+    }
+
+    console.log('[Agent] Shutdown complete. Goodbye!');
+    process.exit(0);
 }
 
 interface Task {
@@ -318,6 +352,11 @@ async function main() {
     console.log(`[Agent] Master: ${MASTER_URL}`);
     console.log('');
 
+    // Setup graceful shutdown handlers
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    console.log('[Agent] Graceful shutdown handlers registered (SIGTERM, SIGINT)');
+
     // Register
     while (!agentToken) {
         const success = await register();
@@ -342,6 +381,12 @@ async function main() {
 
     while (true) {
         try {
+            // Check if shutting down and queue is empty
+            if (isShuttingDown && currentQueue.length === 0) {
+                console.log('[Agent] Shutdown complete - exiting main loop');
+                break;
+            }
+
             // Check if polling is enabled
             if (!isPollingEnabled) {
                 console.log('[Agent] Polling is disabled, processing remaining queue...');
