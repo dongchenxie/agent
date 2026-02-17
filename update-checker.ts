@@ -17,11 +17,13 @@ interface UpdateCheckerConfig {
   repoUrl: string;
   branch: string;
   autoUpdate: boolean;
+  getQueueSize?: () => number; // Function to get current queue size
+  stopPolling?: () => void; // Function to stop polling for new tasks
 }
 
 export class UpdateChecker {
-  private config: UpdateCheckerConfig;
-  private checkTimer: Timer | null = null;
+  public config: UpdateCheckerConfig;
+  private checkTimer: NodeJS.Timeout | null = null;
   private isChecking = false;
   private lastCheckTime: Date | null = null;
   private currentCommit: string | null = null;
@@ -124,6 +126,37 @@ export class UpdateChecker {
   private async performUpdate() {
     try {
       console.log('[UpdateChecker] Starting auto-update...');
+
+      // Stop polling for new tasks
+      if (this.config.stopPolling) {
+        console.log('[UpdateChecker] Stopping task polling...');
+        this.config.stopPolling();
+      }
+
+      // Wait for queue to be empty
+      if (this.config.getQueueSize) {
+        console.log('[UpdateChecker] Waiting for email queue to be empty...');
+
+        let queueSize = this.config.getQueueSize();
+        let waitCount = 0;
+        const maxWaitMinutes = 30; // Maximum wait time: 30 minutes
+        const checkIntervalSeconds = 5;
+
+        while (queueSize > 0 && waitCount < (maxWaitMinutes * 60 / checkIntervalSeconds)) {
+          console.log(`[UpdateChecker] Queue size: ${queueSize}, waiting...`);
+          await new Promise(resolve => setTimeout(resolve, checkIntervalSeconds * 1000));
+          queueSize = this.config.getQueueSize();
+          waitCount++;
+        }
+
+        if (queueSize > 0) {
+          console.error(`[UpdateChecker] Queue still has ${queueSize} emails after ${maxWaitMinutes} minutes. Aborting update.`);
+          console.log('[UpdateChecker] Please update manually when queue is empty: ./auto-update.sh');
+          return;
+        }
+
+        console.log('[UpdateChecker] ✓ Queue is empty, proceeding with update');
+      }
 
       // Check if auto-update script exists
       const scriptPath = join(process.cwd(), 'auto-update.sh');

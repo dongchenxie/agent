@@ -24,6 +24,25 @@ let config = {
     healthCheckInterval: parseInt(process.env.HEALTH_CHECK_INTERVAL || '10000') // Default: 10 seconds
 };
 
+// Queue management
+let currentQueue: Task[] = [];
+let isPollingEnabled = true;
+
+/**
+ * Get current queue size
+ */
+function getQueueSize(): number {
+    return currentQueue.length;
+}
+
+/**
+ * Stop polling for new tasks
+ */
+function stopPolling(): void {
+    isPollingEnabled = false;
+    console.log('[Agent] Polling stopped - no new tasks will be fetched');
+}
+
 interface Task {
     queueId: number;
     campaignId: number;
@@ -314,6 +333,8 @@ async function main() {
 
     // Start update checker
     console.log('[Agent] Starting auto-update checker...');
+    updateChecker.config.getQueueSize = getQueueSize;
+    updateChecker.config.stopPolling = stopPolling;
     updateChecker.start();
 
     // Main polling loop
@@ -321,11 +342,35 @@ async function main() {
 
     while (true) {
         try {
+            // Check if polling is enabled
+            if (!isPollingEnabled) {
+                console.log('[Agent] Polling is disabled, processing remaining queue...');
+
+                // Process remaining queue
+                if (currentQueue.length > 0) {
+                    const task = currentQueue.shift()!;
+                    const result = await sendEmail(task);
+                    await report([result]);
+
+                    if (currentQueue.length > 0) {
+                        await sleep(config.sendInterval);
+                    }
+                }
+
+                // Wait before checking again
+                await sleep(1000);
+                continue;
+            }
+
             // Poll for tasks
             const tasks = await poll();
 
             if (tasks.length > 0) {
                 console.log(`[Agent] Received ${tasks.length} task(s)`);
+
+                // Add to queue
+                currentQueue.push(...tasks);
+                console.log(`[Agent] Queue size: ${currentQueue.length}`);
 
                 const results: TaskResult[] = [];
 
@@ -333,6 +378,12 @@ async function main() {
                 for (const task of tasks) {
                     const result = await sendEmail(task);
                     results.push(result);
+
+                    // Remove from queue after processing
+                    const index = currentQueue.indexOf(task);
+                    if (index > -1) {
+                        currentQueue.splice(index, 1);
+                    }
 
                     // Delay between sends
                     if (tasks.indexOf(task) < tasks.length - 1) {
@@ -344,6 +395,7 @@ async function main() {
                 await report(results);
 
                 console.log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful`);
+                console.log(`[Agent] Queue size: ${currentQueue.length}`);
             }
 
             // Wait before next poll
