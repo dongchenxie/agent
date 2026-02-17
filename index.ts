@@ -19,7 +19,8 @@ let agentToken: string | null = null;
 let config = {
     pollInterval: parseInt(process.env.POLL_INTERVAL || '60000'),  // Default: 1 minute
     sendInterval: parseInt(process.env.SEND_INTERVAL || '2000'),   // Default: 2 seconds
-    batchSize: parseInt(process.env.BATCH_SIZE || '10')            // Default: 10
+    batchSize: parseInt(process.env.BATCH_SIZE || '10'),           // Default: 10
+    healthCheckInterval: parseInt(process.env.HEALTH_CHECK_INTERVAL || '10000') // Default: 10 seconds
 };
 
 interface Task {
@@ -182,6 +183,35 @@ async function report(results: TaskResult[]): Promise<boolean> {
     }
 }
 
+// Send health check heartbeat to master
+async function sendHealthCheck(): Promise<boolean> {
+    if (!agentToken) return false;
+
+    try {
+        const response = await fetch(`${MASTER_URL}/api/agents/health`, {
+            method: 'POST',
+            headers: {
+                'X-Agent-Token': agentToken,
+                'X-Custom-Agent': 'RankScaleAIEmailAgent'
+            }
+        });
+
+        if (!response.ok) {
+            // Don't log errors for health checks to avoid spam
+            // Re-register if token invalid
+            if (response.status === 401) {
+                agentToken = null;
+            }
+            return false;
+        }
+
+        return true;
+    } catch (error) {
+        // Silent failure for health checks
+        return false;
+    }
+}
+
 // Send a single email
 async function sendEmail(task: Task): Promise<TaskResult> {
     const { queueId, contact, campaign, smtp, subject, body, trackingId } = task;
@@ -246,6 +276,21 @@ async function sendEmail(task: Task): Promise<TaskResult> {
     }
 }
 
+// Health check loop - runs independently
+async function healthCheckLoop() {
+    while (true) {
+        try {
+            await sleep(config.healthCheckInterval);
+
+            if (agentToken) {
+                await sendHealthCheck();
+            }
+        } catch (error) {
+            // Silent failure - health checks shouldn't crash the agent
+        }
+    }
+}
+
 // Main loop
 async function main() {
     console.log(`[Agent] Email Loop Agent v${VERSION}`);
@@ -261,6 +306,10 @@ async function main() {
             await sleep(10000);
         }
     }
+
+    // Start health check loop in background
+    console.log(`[Agent] Starting health check loop (interval: ${config.healthCheckInterval}ms)...`);
+    healthCheckLoop().catch(console.error);
 
     // Main polling loop
     console.log('[Agent] Starting polling loop...');
