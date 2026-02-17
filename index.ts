@@ -6,6 +6,7 @@
  */
 
 import nodemailer from 'nodemailer';
+import { updateChecker } from './update-checker';
 
 const VERSION = '1.0.0';
 
@@ -310,6 +311,10 @@ async function main() {
     // Start health check loop in background
     console.log(`[Agent] Starting health check loop (interval: ${config.healthCheckInterval}ms)...`);
     healthCheckLoop().catch(console.error);
+
+    // Start update checker
+    console.log('[Agent] Starting auto-update checker...');
+    updateChecker.start();
 
     // Main polling loop
     console.log('[Agent] Starting polling loop...');
