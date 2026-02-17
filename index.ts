@@ -381,18 +381,11 @@ async function main() {
 
     while (true) {
         try {
-            // Check if shutting down and queue is empty
-            if (isShuttingDown && currentQueue.length === 0) {
-                console.log('[Agent] Shutdown complete - exiting main loop');
-                break;
-            }
-
-            // Check if polling is enabled
+            // Check if polling is disabled
             if (!isPollingEnabled) {
-                console.log('[Agent] Polling is disabled, processing remaining queue...');
-
                 // Process remaining queue
                 if (currentQueue.length > 0) {
+                    console.log('[Agent] Polling is disabled, processing remaining queue...');
                     const task = currentQueue.shift()!;
                     const result = await sendEmail(task);
                     await report([result]);
@@ -400,6 +393,10 @@ async function main() {
                     if (currentQueue.length > 0) {
                         await sleep(config.sendInterval);
                     }
+                } else {
+                    // Queue is empty and polling is disabled - exit
+                    console.log('[Agent] Queue is empty and polling is disabled - exiting');
+                    break;
                 }
 
                 // Wait before checking again
