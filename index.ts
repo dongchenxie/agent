@@ -7,8 +7,11 @@
 
 import nodemailer from 'nodemailer';
 import { updateChecker } from './update-checker';
+import { logger } from './logger';
+import { LogUploader } from './log-uploader';
+import packageJson from './package.json';
 
-const VERSION = '1.0.0';
+const VERSION = packageJson.version;
 
 // 100+ real email client User-Agent strings for X-Mailer header
 const EMAIL_CLIENTS = [
@@ -218,14 +221,20 @@ const MASTER_URL = process.env.MASTER_URL || 'http://localhost:3000';
 const AGENT_SECRET = process.env.AGENT_SECRET || 'change-me-in-production';
 const AGENT_NICKNAME = process.env.AGENT_NICKNAME || `agent-${Date.now()}`;
 
+// Initialize logger
+logger.init();
+
+// Initialize log uploader
+const logUploader = new LogUploader(MASTER_URL, logger.getLogsDir());
+
 // Helper: Format timestamp for logs
 function timestamp(): string {
     return new Date().toISOString();
 }
 
-// Helper: Log with timestamp
+// Helper: Log with timestamp (legacy, use logger instead)
 function log(message: string): void {
-    console.log(`[${timestamp()}] ${message}`);
+    logger.info(message);
 }
 
 // Runtime state
@@ -289,6 +298,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     } else {
         log('[Agent] No pending work');
     }
+
+    // Stop log uploader
+    logUploader.stop();
+
+    // Close logger
+    logger.close();
 
     log('[Agent] Shutdown complete. Goodbye!');
     process.exit(0);
@@ -463,32 +478,76 @@ async function poll(): Promise<Task[]> {
     }
 }
 
-// Report results to master
+// Report results to master with retry mechanism
 async function report(results: TaskResult[]): Promise<boolean> {
     if (!agentToken || results.length === 0) return true;
 
-    try {
-        const response = await fetch(`${MASTER_URL}/api/agents/report`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Agent-Token': agentToken,
-                'X-Custom-Agent': 'RankScaleAIEmailAgent'
-            },
-            body: JSON.stringify({ results })
-        });
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 30000; // 30 seconds
 
-        if (!response.ok) {
-            const error = await response.json();
-            console.error(`[Agent] Report failed: ${error.error}`);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            logger.info(`[Agent] Reporting ${results.length} result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
+
+            const response = await fetch(`${MASTER_URL}/api/agents/report`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Agent-Token': agentToken,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                },
+                body: JSON.stringify({ results })
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                logger.error(`[Agent] Report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`);
+
+                // If this is not the last attempt, wait and retry
+                if (attempt < MAX_RETRIES) {
+                    logger.warn(`[Agent] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                    await sleep(RETRY_DELAY);
+                    continue;
+                }
+
+                // Last attempt failed
+                logger.error(`[Agent] Report failed after ${MAX_RETRIES} attempts. Results will be lost.`, {
+                    results: results.map(r => ({
+                        queueId: r.queueId,
+                        success: r.success,
+                        error: r.errorMessage
+                    }))
+                });
+                return false;
+            }
+
+            // Success
+            logger.info(`[Agent] Successfully reported ${results.length} result(s) to master`);
+            return true;
+
+        } catch (error) {
+            logger.error(`[Agent] Report error (attempt ${attempt}/${MAX_RETRIES}):`, error);
+
+            // If this is not the last attempt, wait and retry
+            if (attempt < MAX_RETRIES) {
+                logger.warn(`[Agent] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                await sleep(RETRY_DELAY);
+                continue;
+            }
+
+            // Last attempt failed
+            logger.error(`[Agent] Report failed after ${MAX_RETRIES} attempts due to network error. Results will be lost.`, {
+                results: results.map(r => ({
+                    queueId: r.queueId,
+                    success: r.success,
+                    error: r.errorMessage
+                }))
+            });
             return false;
         }
-
-        return true;
-    } catch (error) {
-        console.error(`[Agent] Report error:`, error);
-        return false;
     }
+
+    return false;
 }
 
 // Send health check heartbeat to master
@@ -709,6 +768,11 @@ async function main() {
         }
     }
 
+    // Start log uploader
+    log('[Agent] Starting log uploader (interval: 30s)...');
+    logUploader.setToken(agentToken);
+    logUploader.start();
+
     // Start health check loop in background
     log(`[Agent] Starting health check loop (interval: ${config.healthCheckInterval}ms)...`);
     healthCheckLoop().catch(console.error);
@@ -732,7 +796,13 @@ async function main() {
                     log('[Agent] Polling is disabled, processing remaining queue...');
                     const task = currentQueue.shift()!;
                     const result = await sendEmail(task);
-                    await report([result]);
+
+                    // Report with retry mechanism
+                    const reportSuccess = await report([result]);
+                    if (!reportSuccess) {
+                        logger.warn('[Agent] Failed to report result after 5 retries, but continuing with remaining queue');
+                    }
+
                     isProcessing = false;
 
                     if (currentQueue.length > 0) {
@@ -779,11 +849,15 @@ async function main() {
                     }
                 }
 
-                // Report results
-                await report(results);
+                // Report results with retry mechanism
+                const reportSuccess = await report(results);
                 isProcessing = false;
 
-                log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful`);
+                if (reportSuccess) {
+                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful`);
+                } else {
+                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful, but failed to report to master after 5 retries`);
+                }
                 log(`[Agent] Queue size: ${currentQueue.length}`);
             }
 
