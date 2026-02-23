@@ -401,9 +401,15 @@ async function getOAuth2AccessToken(clientId: string, refreshToken: string): Pro
 // Register with master server
 async function register(): Promise<boolean> {
     try {
-        log(`[Agent] Registering as "${AGENT_NICKNAME}" with master at ${MASTER_URL}...`);
+        // Remove trailing slash from MASTER_URL to avoid double slashes
+        const baseUrl = MASTER_URL.replace(/\/$/, '');
+        const url = `${baseUrl}/api/agents/register`;
 
-        const response = await fetch(`${MASTER_URL}/api/agents/register`, {
+        log(`[Agent] Registering as "${AGENT_NICKNAME}" with master at ${url}...`);
+        log(`[Agent] Secret: ${AGENT_SECRET?.substring(0, 10)}...`);
+        log(`[Agent] Version: ${VERSION}`);
+
+        const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -444,7 +450,8 @@ async function poll(): Promise<Task[]> {
     }
 
     try {
-        const response = await fetch(`${MASTER_URL}/api/agents/poll`, {
+        const baseUrl = MASTER_URL.replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/agents/poll`, {
             method: 'GET',
             headers: {
                 'X-Agent-Token': agentToken,
@@ -489,7 +496,8 @@ async function report(results: TaskResult[]): Promise<boolean> {
         try {
             logger.info(`[Agent] Reporting ${results.length} result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
 
-            const response = await fetch(`${MASTER_URL}/api/agents/report`, {
+            const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const response = await fetch(`${baseUrl}/api/agents/report`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -555,7 +563,8 @@ async function sendHealthCheck(): Promise<boolean> {
     if (!agentToken) return false;
 
     try {
-        const response = await fetch(`${MASTER_URL}/api/agents/health`, {
+        const baseUrl = MASTER_URL.replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/agents/health`, {
             method: 'POST',
             headers: {
                 'X-Agent-Token': agentToken,
