@@ -68,12 +68,17 @@ if [ -f .env ]; then
     log_success "Backed up .env file"
 fi
 
+# Stash any local changes before pulling
+log_info "Stashing local changes..."
+git stash 2>&1 | tee -a "$LOG_FILE"
+
 # Pull latest changes
 log_info "Pulling latest changes..."
 git pull origin master 2>&1 | tee -a "$LOG_FILE"
+PULL_EXIT_CODE=${PIPESTATUS[0]}
 
-if [ $? -ne 0 ]; then
-    log_error "Failed to pull updates"
+if [ $PULL_EXIT_CODE -ne 0 ]; then
+    log_error "Failed to pull updates (exit code: $PULL_EXIT_CODE)"
     # Restore .env if backup exists
     if [ -f .env.backup ]; then
         mv .env.backup .env
