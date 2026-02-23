@@ -109,6 +109,59 @@ else
     print_success "Git installed successfully"
 fi
 
+# Install unzip if not present (required for Bun installer)
+print_header "Step 0.5: Checking unzip installation"
+
+if command -v unzip &> /dev/null; then
+    print_success "unzip is already installed"
+else
+    print_info "unzip not found, installing..."
+
+    if [ "$OS" == "linux" ]; then
+        # Detect Linux distribution
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            DISTRO=$ID
+        else
+            print_error "Cannot detect Linux distribution"
+            exit 1
+        fi
+
+        case $DISTRO in
+            ubuntu|debian)
+                print_info "Installing unzip on Ubuntu/Debian..."
+                sudo apt-get update
+                sudo apt-get install -y unzip
+                ;;
+            centos|rhel|fedora)
+                print_info "Installing unzip on CentOS/RHEL/Fedora..."
+                sudo yum install -y unzip
+                ;;
+            arch)
+                print_info "Installing unzip on Arch Linux..."
+                sudo pacman -S --noconfirm unzip
+                ;;
+            *)
+                print_error "Unsupported Linux distribution: $DISTRO"
+                print_info "Please install unzip manually: sudo apt-get install unzip (or equivalent)"
+                exit 1
+                ;;
+        esac
+    else
+        # macOS - unzip is usually pre-installed, but check homebrew if needed
+        print_info "Installing unzip on macOS..."
+        if command -v brew &> /dev/null; then
+            brew install unzip
+        else
+            print_error "Homebrew not found and unzip is missing."
+            print_info "unzip is usually pre-installed on macOS. Please check your system."
+            exit 1
+        fi
+    fi
+
+    print_success "unzip installed successfully"
+fi
+
 # Install Bun if not already installed
 print_header "Step 1: Installing Bun.js"
 
