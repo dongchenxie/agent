@@ -186,15 +186,27 @@ export class LogUploader {
         length: number
     ): Promise<{ success: boolean; appended?: boolean; fileSize?: number }> {
         if (!this.agentToken) {
+            console.error('[LogUploader] No agent token available');
             return { success: false };
         }
 
         try {
-            const response = await fetch(`${this.masterUrl}/api/agents/logs`, {
+            // Remove trailing slash from masterUrl to avoid double slashes
+            const baseUrl = this.masterUrl.replace(/\/$/, '');
+            const url = `${baseUrl}/api/agents/logs`;
+            console.log(`[LogUploader] Uploading to ${url}`, {
+                filename,
+                offset,
+                length,
+                contentPreview: content.substring(0, 100)
+            });
+
+            const response = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Agent-Token': this.agentToken,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
                 },
                 body: JSON.stringify({
                     filename,
@@ -205,20 +217,66 @@ export class LogUploader {
                 })
             });
 
+            console.log(`[LogUploader] Response status: ${response.status} ${response.statusText}`);
+
             if (!response.ok) {
-                const error = await response.json();
-                console.error(`[LogUploader] Upload failed: ${error.error}`);
+                const contentType = response.headers.get('content-type');
+                console.error(`[LogUploader] Upload failed with status ${response.status}`, {
+                    contentType,
+                    statusText: response.statusText
+                });
+
+                let errorMessage = `HTTP ${response.status}`;
+                try {
+                    if (contentType?.includes('application/json')) {
+                        const error = await response.json();
+                        errorMessage = error.error || JSON.stringify(error);
+                        console.error(`[LogUploader] Error details:`, error);
+                    } else {
+                        const text = await response.text();
+                        errorMessage = text.substring(0, 200);
+                        console.error(`[LogUploader] Error response (non-JSON):`, text.substring(0, 500));
+                    }
+                } catch (parseError) {
+                    console.error(`[LogUploader] Failed to parse error response:`, parseError);
+                }
+
+                console.error(`[LogUploader] Upload failed: ${errorMessage}`);
                 return { success: false };
             }
 
-            const result = await response.json();
+            const contentType = response.headers.get('content-type');
+            console.log(`[LogUploader] Success response content-type: ${contentType}`);
+
+            let result;
+            try {
+                const text = await response.text();
+                console.log(`[LogUploader] Response body:`, text.substring(0, 200));
+                result = JSON.parse(text);
+            } catch (parseError) {
+                console.error(`[LogUploader] Failed to parse success response as JSON:`, parseError);
+                console.error(`[LogUploader] Response was not valid JSON`);
+                return { success: false };
+            }
+
+            console.log(`[LogUploader] Upload successful`, {
+                appended: result.appended,
+                reason: result.reason,
+                fileSize: result.fileSize
+            });
+
             return {
                 success: true,
                 appended: result.appended,
                 fileSize: result.fileSize
             };
         } catch (error) {
-            console.error('[LogUploader] Upload error:', error);
+            console.error('[LogUploader] Upload error (exception):', error);
+            if (error instanceof Error) {
+                console.error('[LogUploader] Error name:', error.name);
+                console.error('[LogUploader] Error message:', error.message);
+                console.error('[LogUploader] Error stack:', error.stack);
+            }
             return { success: false };
         }
     }
