@@ -797,6 +797,8 @@ async function main() {
 
     while (true) {
         try {
+            log('[Agent] Polling loop iteration starting...');
+
             // Check if polling is disabled
             if (!isPollingEnabled) {
                 // Process remaining queue
@@ -829,7 +831,9 @@ async function main() {
             }
 
             // Poll for tasks
+            log('[Agent] Calling poll()...');
             const tasks = await poll();
+            log(`[Agent] Poll returned ${tasks.length} task(s)`);
 
             if (tasks.length > 0) {
                 isProcessing = true;

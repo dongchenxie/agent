@@ -30,10 +30,10 @@ interface LogEntry {
 }
 
 class AgentLogger {
-    private logFileStream: fs.WriteStream | null = null;
     private logFilePath: string = '';
     private logFileName: string = '';
     private logsDir: string = '';
+    private logFileDescriptor: number | null = null;
 
     constructor() {
         // Initialize on first use
@@ -54,7 +54,9 @@ class AgentLogger {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         this.logFileName = `run-${timestamp}.log`;
         this.logFilePath = path.join(this.logsDir, this.logFileName);
-        this.logFileStream = fs.createWriteStream(this.logFilePath, { flags: 'a' });
+
+        // Open file descriptor for synchronous writes (more reliable with Bun)
+        this.logFileDescriptor = fs.openSync(this.logFilePath, 'a');
 
         console.log(`[Logger] Logging to: ${this.logFilePath}`);
         this.log(LogLevel.INFO, `Agent logger initialized. Log file: ${this.logFileName}`);
@@ -122,9 +124,13 @@ class AgentLogger {
             console.log(coloredOutput);
         }
 
-        // File output (JSON, single line)
-        if (this.logFileStream) {
-            this.logFileStream.write(logLine + '\n');
+        // File output (JSON, single line) - use synchronous write for reliability
+        if (this.logFileDescriptor !== null) {
+            try {
+                fs.writeSync(this.logFileDescriptor, logLine + '\n');
+            } catch (error) {
+                console.error('[Logger] Failed to write to log file:', error);
+            }
         }
     }
 
@@ -188,9 +194,13 @@ class AgentLogger {
     }
 
     close() {
-        if (this.logFileStream) {
-            this.logFileStream.end();
-            this.logFileStream = null;
+        if (this.logFileDescriptor !== null) {
+            try {
+                fs.closeSync(this.logFileDescriptor);
+            } catch (error) {
+                console.error('[Logger] Error closing log file:', error);
+            }
+            this.logFileDescriptor = null;
         }
     }
 }
