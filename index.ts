@@ -598,6 +598,20 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             throw new Error('Missing pre-generated email content');
         }
 
+        // Log detailed email information for debugging
+        logger.info(`[Agent] Preparing email:`, {
+            queueId,
+            campaignId: task.campaignId,
+            to: contact.email,
+            from: smtp.email,
+            subjectLength: subject.length,
+            bodyLength: body.length,
+            hasTrackingId: !!trackingId,
+            replyTo: campaign?.replyTo || smtp.email,
+            smtpHost: smtp.host || 'smtp.gmail.com',
+            smtpPort: smtp.port || 587
+        });
+
         const isSecure = smtp.secure === true;
         const authType = smtp.authType || 'basic';
 
@@ -647,7 +661,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             const replyTo = campaign?.replyTo || smtp.email;
             const xMailer = getXMailerForEmail(smtp.email);
 
-            await transporter.sendMail({
+            const sendResult = await transporter.sendMail({
                 from: smtp.email,
                 to: contact.email,
                 subject,
@@ -657,6 +671,16 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                     'X-Mailer': xMailer,
                     'X-Priority': '3',
                 }
+            });
+
+            // Log SMTP response details
+            logger.info(`[Agent] SMTP accepted email (OAuth2):`, {
+                queueId,
+                to: contact.email,
+                messageId: sendResult.messageId,
+                response: sendResult.response,
+                accepted: sendResult.accepted,
+                rejected: sendResult.rejected
             });
 
             // Post-send delay
@@ -700,7 +724,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             const replyTo = campaign?.replyTo || smtp.email;
             const xMailer = getXMailerForEmail(smtp.email);
 
-            await transporter.sendMail({
+            const sendResult = await transporter.sendMail({
                 from: smtp.email,
                 to: contact.email,
                 subject,
@@ -710,6 +734,19 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                     'X-Mailer': xMailer,
                     'X-Priority': '3',
                 }
+            });
+
+            // Log SMTP response details
+            logger.info(`[Agent] SMTP accepted email (Basic Auth):`, {
+                queueId,
+                campaignId: task.campaignId,
+                to: contact.email,
+                from: smtp.email,
+                messageId: sendResult.messageId,
+                response: sendResult.response,
+                accepted: sendResult.accepted,
+                rejected: sendResult.rejected,
+                pending: sendResult.pending
             });
 
             // Post-send delay
@@ -729,7 +766,16 @@ async function sendEmail(task: Task): Promise<TaskResult> {
         }
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error(`[Agent] Failed to send to ${contact.email}: ${errorMessage}`);
+
+        // Log detailed error information
+        logger.error(`[Agent] Failed to send email:`, {
+            queueId,
+            campaignId: task.campaignId,
+            to: contact.email,
+            from: smtp.email,
+            error: errorMessage,
+            errorStack: error instanceof Error ? error.stack : undefined
+        });
 
         return {
             queueId,
