@@ -1,6 +1,6 @@
 {
   "name": "email-loop-agent",
-  "version": "1.0.60",
+  "version": "1.1.0",
   "description": "Distributed email sending agent for Email Loop",
   "main": "index.ts",
   "scripts": {
@@ -8,6 +8,8 @@
     "dev": "bun run --watch index.ts"
   },
   "dependencies": {
+    "imap": "^0.8.19",
+    "mailparser": "^3.9.3",
     "nodemailer": "^7.0.12"
   },
   "devDependencies": {

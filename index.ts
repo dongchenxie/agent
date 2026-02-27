@@ -6,6 +6,8 @@
  */
 
 import nodemailer from 'nodemailer';
+import Imap from 'imap';
+import { simpleParser } from 'mailparser';
 import { updateChecker } from './update-checker';
 import { logger } from './logger';
 import { LogUploader } from './log-uploader';
@@ -356,6 +358,37 @@ interface TaskResult {
     errorMessage?: string;
 }
 
+interface ImapTask {
+    accountId: number;
+    email: string;
+    delaySeconds: number;
+    imapConfig: {
+        host: string;
+        port: number;
+        secure: boolean;
+        user: string;
+        password: string;
+    };
+}
+
+interface ImapTaskResult {
+    accountId: number;
+    email: string;
+    success: boolean;
+    emails: ReceivedEmail[];
+    errorMessage?: string;
+}
+
+interface ReceivedEmail {
+    messageId: string;
+    from: { email: string; name?: string };
+    to: string;
+    subject: string;
+    textBody?: string;
+    htmlBody?: string;
+    receivedAt: string;
+}
+
 // Helper: Sleep
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -558,6 +591,54 @@ async function report(results: TaskResult[]): Promise<boolean> {
     return false;
 }
 
+// Report IMAP results to master with retry mechanism
+async function reportImap(results: ImapTaskResult[]): Promise<boolean> {
+    if (!agentToken || results.length === 0) return true;
+
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 30000; // 30 seconds
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            logger.info(`[IMAP] Reporting ${results.length} result(s) (attempt ${attempt}/${MAX_RETRIES})`);
+
+            const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const response = await fetch(`${baseUrl}/api/agents/report-imap`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Agent-Token': agentToken,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                },
+                body: JSON.stringify({ results })
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                logger.error(`[IMAP] Report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`);
+
+                if (attempt < MAX_RETRIES) {
+                    logger.warn(`[IMAP] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                    await sleep(RETRY_DELAY);
+                    continue;
+                }
+                return false;
+            }
+
+            logger.info(`[IMAP] Successfully reported ${results.length} result(s)`);
+            return true;
+
+        } catch (error) {
+            logger.error(`[IMAP] Report error (attempt ${attempt}/${MAX_RETRIES}):`, error);
+            if (attempt < MAX_RETRIES) {
+                logger.warn(`[IMAP] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                await sleep(RETRY_DELAY);
+            }
+        }
+    }
+    return false;
+}
+
 // Send health check heartbeat to master
 async function sendHealthCheck(): Promise<boolean> {
     if (!agentToken) return false;
@@ -615,6 +696,21 @@ async function sendEmail(task: Task): Promise<TaskResult> {
         const isSecure = smtp.secure === true;
         const authType = smtp.authType || 'basic';
 
+        // Detect AOL SMTP - AOL has strict Reply-To validation
+        const isAOL = smtp.host?.includes('aol.com') || smtp.email?.includes('@aol.com');
+
+        // For AOL SMTP, force Reply-To to sender's email to avoid 550 errors
+        // AOL rejects emails when Reply-To = recipient address (anti-phishing)
+        let finalReplyTo: string;
+        if (isAOL) {
+            finalReplyTo = smtp.email;
+            if (campaign?.replyTo && campaign.replyTo !== smtp.email) {
+                logger.warn(`[Agent] AOL SMTP detected - overriding Reply-To from "${campaign.replyTo}" to "${smtp.email}" to avoid rejection`);
+            }
+        } else {
+            finalReplyTo = campaign?.replyTo || smtp.email;
+        }
+
         // Handle OAuth2 authentication for Outlook/Microsoft 365
         if (authType === 'oauth2') {
             log(`[Agent] Using OAuth2 authentication for ${smtp.email}`);
@@ -658,7 +754,6 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             await randomDelay(1000, 3000); // Initial connection delay
 
             // Send email
-            const replyTo = campaign?.replyTo || smtp.email;
             const xMailer = getXMailerForEmail(smtp.email);
 
             const sendResult = await transporter.sendMail({
@@ -666,7 +761,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 to: contact.email,
                 subject,
                 html: body,
-                replyTo,
+                replyTo: finalReplyTo,
                 headers: {
                     'X-Mailer': xMailer,
                     'X-Priority': '3',
@@ -676,7 +771,11 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             // Log SMTP response details
             logger.info(`[Agent] SMTP accepted email (OAuth2):`, {
                 queueId,
+                campaignId: task.campaignId,
                 to: contact.email,
+                from: smtp.email,
+                replyTo: finalReplyTo,
+                isAOL,
                 messageId: sendResult.messageId,
                 response: sendResult.response,
                 accepted: sendResult.accepted,
@@ -721,7 +820,6 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             await randomDelay(1000, 3000); // Initial connection delay
 
             // Send email
-            const replyTo = campaign?.replyTo || smtp.email;
             const xMailer = getXMailerForEmail(smtp.email);
 
             const sendResult = await transporter.sendMail({
@@ -729,7 +827,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 to: contact.email,
                 subject,
                 html: body,
-                replyTo,
+                replyTo: finalReplyTo,
                 headers: {
                     'X-Mailer': xMailer,
                     'X-Priority': '3',
@@ -742,6 +840,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 campaignId: task.campaignId,
                 to: contact.email,
                 from: smtp.email,
+                replyTo: finalReplyTo,
+                isAOL,
                 messageId: sendResult.messageId,
                 response: sendResult.response,
                 accepted: sendResult.accepted,
@@ -787,6 +887,167 @@ async function sendEmail(task: Task): Promise<TaskResult> {
     }
 }
 
+// Check IMAP for new emails - agent directly connects to IMAP server
+async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
+    const { accountId, email, imapConfig } = task;
+
+    try {
+        logger.info(`[IMAP] Starting check for ${email}`, {
+            accountId,
+            host: imapConfig.host,
+            port: imapConfig.port
+        });
+
+        // Wait for the specified delay (human-like behavior)
+        if (task.delaySeconds > 0) {
+            logger.info(`[IMAP] Waiting ${task.delaySeconds}s before checking ${email}`);
+            await sleep(task.delaySeconds * 1000);
+        }
+
+        // Connection delay (0-5 seconds)
+        const connectDelay = Math.floor(Math.random() * 5000);
+        logger.info(`[IMAP] Random connect delay: ${connectDelay}ms`);
+        await sleep(connectDelay);
+
+        // Use Promise to wrap IMAP operations
+        const emails = await new Promise<ReceivedEmail[]>((resolve, reject) => {
+            const imap = new Imap({
+                user: imapConfig.user,
+                password: imapConfig.password,
+                host: imapConfig.host,
+                port: imapConfig.port,
+                tls: imapConfig.secure,
+                tlsOptions: { rejectUnauthorized: false },
+                connTimeout: 30000,
+                authTimeout: 15000
+            });
+
+            const fetchedEmails: ReceivedEmail[] = [];
+            let processedCount = 0;
+            let totalMessages = 0;
+
+            imap.once('ready', () => {
+                // Open mailbox delay (0-2 seconds)
+       const openDelay = Math.floor(Math.random() * 2000);
+                logger.info(`[IMAP] Random open delay: ${openDelay}ms`);
+
+                setTimeout(() => {
+                    imap.openBox('INBOX', false, (err: any, box: any) => {
+                        if (err) {
+                            imap.end();
+                            return reject(err);
+                        }
+
+                        // Search for unread emails
+                        imap.search(['UNSEEN'], (err: any, results: any) => {
+                            if (err) {
+                                imap.end();
+                                return reject(err);
+                            }
+
+                            if (!results || results.length === 0) {
+                                logger.info(`[IMAP] No new messages for ${email}`);
+                                imap.end();
+                                return resolve([]);
+                            }
+
+                            totalMessages = results.length;
+                            logger.info(`[IMAP] Found ${totalMessages} new messages for ${email}`);
+
+                            const fetch = imap.fetch(results, { bodies: '', markSeen: false });
+
+                            fetch.on('message', (msg: any, seqno: number) => {
+                                msg.on('body', (stream: any) => {
+                                    simpleParser(stream, async (err: any, parsed: any) => {
+                                        if (err) {
+                                            logger.error(`[IMAP] Error parsing message ${seqno}:`, err);
+                                            processedCount++;
+                                            return;
+                                        }
+
+                                        try {
+                                            const fromObj = Array.isArray(parsed.from) ? parsed.from[0] : parsed.from;
+                                            const toObj = Array.isArray(parsed.to) ? parsed.to[0] : parsed.to;
+                                            const fromAddress = fromObj?.value?.[0];
+                                            const toAddress = toObj?.value?.[0];
+
+                                            const receivedEmail: ReceivedEmail = {
+                                                messageId: parsed.messageId || `generated-${Date.now()}-${seqno}`,
+                                                from: {
+                                                    email: fromAddress?.address || 'unknown@unknown.com',
+                                                    name: fromAddress?.name
+                                                },
+                                                to: toAddress?.address || '',
+                                                subject: parsed.subject || '(No Subject)',
+                                                textBody: parsed.text,
+                                                htmlBody: parsed.html ? String(parsed.html) : undefined,
+                                                receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString()
+                                            };
+
+                                            fetchedEmails.push(receivedEmail);
+                                            logger.info(`[IMAP] Parsed email: ${receivedEmail.subject} from ${receivedEmail.from.email}`);
+                                        } catch (error) {
+                                            logger.error(`[IMAP] Error processing email ${seqno}:`, error);
+                                        }
+
+                                        processedCount++;
+                                    });
+                                });
+                            });
+
+                            fetch.once('error', (err: any) => {
+                                logger.error('[IMAP] Fetch error:', err);
+                                imap.end();
+                                reject(err);
+                            });
+
+                            fetch.once('end', () => {
+                                logger.info(`[IMAP] Fetch completed. Processed ${processedCount}/${totalMessages} messages`);
+                                setTimeout(() => {
+                                    imap.end();
+                                }, 1000);
+                            });
+                        });
+                    });
+                }, openDelay);
+            });
+
+            imap.once('error', (err: any) => {
+                logger.error('[IMAP] Connection error:', err);
+                reject(err);
+            });
+
+            imap.once('end', () => {
+                logger.info(`[IMAP] Connection ended for ${email}`);
+                resolve(fetchedEmails);
+            });
+
+            imap.connect();
+        });
+
+        logger.info(`[IMAP] Check completed for ${email}: ${emails.length} emails fetched`);
+
+        return {
+            accountId,
+            email,
+            success: true,
+            emails
+        };
+
+    } catch (error: any) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.error(`[IMAP] Check failed for ${email}:`, error);
+
+        return {
+            accountId,
+            email,
+            success: false,
+            emails: [],
+            errorMessage
+        };
+    }
+}
+
 // Health check loop - runs independently
 async function healthCheckLoop() {
     while (true) {
@@ -798,6 +1059,77 @@ async function healthCheckLoop() {
             }
         } catch (error) {
             // Silent failure - health checks shouldn't crash the agent
+        }
+    }
+}
+
+// IMAP polling loop - runs independently
+async function imapPollingLoop() {
+    log('[Agent] IMAP polling loop started');
+
+    while (true) {
+        try {
+            // Wait for poll interval before checking
+            await sleep(config.pollInterval);
+
+            if (!agentToken) {
+                continue;
+            }
+
+            // Poll for IMAP tasks
+            const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const response = await fetch(`${baseUrl}/api/agents/poll-imap`, {
+                method: 'GET',
+                headers: {
+                    'X-Agent-Token': agentToken,
+                    'X-Agent-Version': VERSION,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                }
+            });
+
+            if (!response.ok) {
+                logger.warn(`[IMAP] Poll failed: ${response.status} ${response.statusText}`);
+                continue;
+            }
+
+            const data = await response.json();
+
+            if (!data.success || !data.tasks || data.tasks.length === 0) {
+                continue;
+            }
+
+            logger.info(`[IMAP] Received ${data.tasks.length} IMAP check tasks`);
+
+            // Update config (dynamic rate limiting adjustment)
+            if (data.config) {
+                config = { ...config, ...data.config };
+            }
+
+            // Process tasks and collect results
+            const results: ImapTaskResult[] = [];
+
+            for (const task of data.tasks) {
+                const result = await checkImap(task);
+                results.push(result);
+
+                // Task interval delay (rate limiting: controls check frequency, avoids simultaneous IMAP connections)
+                if (data.tasks.indexOf(task) < data.tasks.length - 1) {
+                    logger.info(`[IMAP] Waiting ${config.sendInterval}ms before next check (rate limiting)`);
+                    await sleep(config.sendInterval);
+                }
+            }
+
+            // Report all results
+            if (results.length > 0) {
+                const reportSuccess = await reportImap(results);
+                if (!reportSuccess) {
+                    logger.warn('[IMAP] Failed to report results after 5 retries');
+                }
+            }
+
+        } catch (error) {
+            logger.error('[IMAP] Polling loop error:', error);
+            await sleep(60000); // Wait 1 minute on error
         }
     }
 }
@@ -831,6 +1163,10 @@ async function main() {
     // Start health check loop in background
     log(`[Agent] Starting health check loop (interval: ${config.healthCheckInterval}ms)...`);
     healthCheckLoop().catch(console.error);
+
+    // Start IMAP polling loop in background
+    log(`[Agent] Starting IMAP polling loop (interval: ${config.pollInterval}ms)...`);
+    imapPollingLoop().catch(console.error);
 
     // Start update checker
     log('[Agent] Starting auto-update checker...');
