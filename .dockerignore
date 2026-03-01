@@ -1,0 +1,39 @@
+# Node modules
+node_modules/
+bun.lockb
+
+# Logs
+logs/
+*.log
+
+# Environment files (will be mounted)
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+dist/
+build/

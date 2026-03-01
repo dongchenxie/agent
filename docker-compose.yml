@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  email-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: email-loop-agent
+    restart: unless-stopped
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
+    # Additional environment variables (optional)
+    environment:
+      - NODE_ENV=production
+      - TZ=UTC
+
+    # Mount logs directory for persistence
+    volumes:
+      - ./logs:/app/logs
+      - ./auto-update.log:/app/auto-update.log
+
+    # Network mode (use host network for better connectivity)
+    network_mode: host
+
+    # Resource limits (optional, adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check - verify the agent process is running
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pgrep -f 'bun.*index.ts' > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
