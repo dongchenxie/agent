@@ -4,7 +4,8 @@
 # Email Loop Agent - User Setup Script
 #############################################
 # This script creates a new sudo user and sets up the agent
-# Usage (as root): bash setup-user.sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/setup-user.sh | sudo bash
+# Or: sudo bash setup-user.sh
 #############################################
 
 set -e
@@ -39,6 +40,43 @@ print_info() {
     echo -e "${BLUE}ℹ $1${NC}"
 }
 
+# Check if stdin is a terminal (interactive mode)
+if [ -t 0 ]; then
+    INTERACTIVE=true
+else
+    INTERACTIVE=false
+fi
+
+# If running through pipe (curl | bash), download and re-execute with proper stdin
+if [ "$INTERACTIVE" = false ] && [ -z "$REEXECUTED" ]; then
+    print_info "Detected pipe mode, downloading script for interactive execution..."
+
+    TEMP_SCRIPT=$(mktemp /tmp/setup-user-XXXXXX.sh)
+
+    # Download the script
+    if command -v curl &> /dev/null; then
+        curl -fsSL https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/setup-user.sh -o "$TEMP_SCRIPT"
+    elif command -v wget &> /dev/null; then
+        wget -qO "$TEMP_SCRIPT" https://raw.githubusercontent.com/dongchenxie/agent/refs/heads/master/setup-user.sh
+    else
+        # If we can't download, try to use the current script
+        cat > "$TEMP_SCRIPT" << 'SCRIPTEOF'
+#!/bin/bash
+# Script content will be here
+SCRIPTEOF
+    fi
+
+    chmod +x "$TEMP_SCRIPT"
+
+    # Re-execute with proper stdin
+    export REEXECUTED=1
+    exec bash "$TEMP_SCRIPT" < /dev/tty
+
+    # Cleanup (won't reach here due to exec)
+    rm -f "$TEMP_SCRIPT"
+    exit 0
+fi
+
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
     print_error "This script must be run as root"
@@ -48,18 +86,28 @@ fi
 
 print_header "Email Loop Agent - User Setup"
 
-# Get username
-echo ""
-read -p "Enter username to create (default: agent): " USERNAME
-USERNAME=${USERNAME:-agent}
+# Get username from environment variable or prompt
+if [ -n "$AGENT_USERNAME" ]; then
+    USERNAME="$AGENT_USERNAME"
+    print_info "Using username from environment: $USERNAME"
+else
+    echo ""
+    read -p "Enter username to create (default: agent): " USERNAME < /dev/tty
+    USERNAME=${USERNAME:-agent}
+fi
 
 # Check if user already exists
 if id "$USERNAME" &>/dev/null; then
     print_warning "User '$USERNAME' already exists"
-    read -p "Do you want to continue and switch to this user? (y/n): " CONTINUE
-    if [ "$CONTINUE" != "y" ]; then
-        print_info "Exiting..."
-        exit 0
+
+    if [ -n "$AGENT_SKIP_EXISTING" ]; then
+        print_info "Skipping user creation (AGENT_SKIP_EXISTING is set)"
+    else
+        read -p "Do you want to continue and switch to this user? (y/n): " CONTINUE < /dev/tty
+        if [ "$CONTINUE" != "y" ]; then
+            print_info "Exiting..."
+            exit 0
+        fi
     fi
 else
     # Get password
@@ -70,9 +118,14 @@ else
     useradd -m -s /bin/bash "$USERNAME"
 
     # Set password
-    echo ""
-    print_info "Please set a password for user '$USERNAME':"
-    passwd "$USERNAME"
+    if [ -n "$AGENT_PASSWORD" ]; then
+        echo "$USERNAME:$AGENT_PASSWORD" | chpasswd
+        print_success "Password set from environment variable"
+    else
+        echo ""
+        print_info "Please set a password for user '$USERNAME':"
+        passwd "$USERNAME" < /dev/tty
+    fi
 
     # Add user to sudo group
     usermod -aG sudo "$USERNAME"
@@ -107,17 +160,15 @@ print_success "Set ownership to $USERNAME"
 
 # Create a helper script to switch to the user
 SWITCH_SCRIPT="/usr/local/bin/switch-to-$USERNAME"
-cat > "$SWITCH_SCRIPT" << 'SWITCHEOF'
+cat > "$SWITCH_SCRIPT" << SWITCHEOF
 #!/bin/bash
-USERNAME="__USERNAME__"
-echo "Switching to user '$USERNAME'..."
-echo "Agent directory: /home/$USERNAME/agent"
+USERNAME="$USERNAME"
+echo "Switching to user '\$USERNAME'..."
+echo "Agent directory: /home/\$USERNAME/agent"
 echo ""
-exec su - "$USERNAME"
+exec su - "\$USERNAME"
 SWITCHEOF
 
-# Replace placeholder
-sed -i "s/__USERNAME__/$USERNAME/g" "$SWITCH_SCRIPT"
 chmod +x "$SWITCH_SCRIPT"
 
 print_success "Created switch script at $SWITCH_SCRIPT"
@@ -142,13 +193,20 @@ print_info "Then run the agent installer:"
 echo -e "  ${GREEN}bash install.sh${NC}"
 echo ""
 
-# Ask if user wants to switch now
-read -p "Do you want to switch to user '$USERNAME' now? (y/n): " SWITCH_NOW
-if [ "$SWITCH_NOW" = "y" ]; then
-    echo ""
-    print_info "Switching to user '$USERNAME'..."
-    echo ""
-    exec su - "$USERNAME"
+# Ask if user wants to switch now (only in interactive mode)
+if [ "$INTERACTIVE" = true ] || [ -t 0 ]; then
+    read -p "Do you want to switch to user '$USERNAME' now? (y/n): " SWITCH_NOW < /dev/tty
+    if [ "$SWITCH_NOW" = "y" ]; then
+        echo ""
+        print_info "Switching to user '$USERNAME'..."
+        echo ""
+        exec su - "$USERNAME"
+    fi
 fi
 
 print_success "Done!"
+
+# Cleanup temp script if it exists
+if [ -n "$REEXECUTED" ] && [ -f "$TEMP_SCRIPT" ]; then
+    rm -f "$TEMP_SCRIPT"
+fi
