@@ -1,0 +1,19 @@
+{
+  "name": "email-loop-agent-tests",
+  "version": "1.0.0",
+  "description": "Test suite for Email Loop Agent refactoring",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:integration": "jest --testPathPattern=integration",
+    "test:unit": "jest --testPathPattern=unit"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.5.0",
+    "ts-jest": "^29.1.0",
+    "nock": "^13.3.0"
+  }
+}

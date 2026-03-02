@@ -65,27 +65,48 @@ class AgentLogger {
     private cleanupOldLogs() {
         try {
             const now = Date.now();
-            const maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
+            const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days (reduced from 30 days for 512MB memory limit)
+            const maxFileSize = 10 * 1024 * 1024; // 10MB max per file
 
             const files = fs.readdirSync(this.logsDir);
             let deletedCount = 0;
+            let totalSize = 0;
 
-            for (const file of files) {
-                if (!file.endsWith('.log')) continue;
+            // Get all log files with their stats
+            const logFiles = files
+                .filter(file => file.endsWith('.log'))
+                .map(file => {
+                    const filePath = path.join(this.logsDir, file);
+                    const stats = fs.statSync(filePath);
+                    return { file, filePath, stats };
+                })
+                .sort((a, b) => b.stats.mtime.getTime() - a.stats.mtime.getTime()); // Newest first
 
-                const filePath = path.join(this.logsDir, file);
-                const stats = fs.statSync(filePath);
+            // Delete old logs or oversized logs
+            for (const { file, filePath, stats } of logFiles) {
                 const age = now - stats.mtime.getTime();
 
-                if (age > maxAge) {
+                if (age > maxAge || stats.size > maxFileSize) {
                     fs.unlinkSync(filePath);
                     deletedCount++;
-                    console.log(`[Logger] Deleted old log file: ${file}`);
+                    console.log(`[Logger] Deleted log file: ${file} (age: ${Math.round(age / 86400000)}d, size: ${Math.round(stats.size / 1024)}KB)`);
+                } else {
+                    totalSize += stats.size;
+                }
+            }
+
+            // Keep only last 20 log files to prevent disk space issues
+            const remainingFiles = logFiles.filter(f => fs.existsSync(f.filePath));
+            if (remainingFiles.length > 20) {
+                for (let i = 20; i < remainingFiles.length; i++) {
+                    fs.unlinkSync(remainingFiles[i].filePath);
+                    deletedCount++;
+                    console.log(`[Logger] Deleted old log file (keeping only 20 newest): ${remainingFiles[i].file}`);
                 }
             }
 
             if (deletedCount > 0) {
-                console.log(`[Logger] Cleaned up ${deletedCount} old log file(s)`);
+                console.log(`[Logger] Cleaned up ${deletedCount} log file(s). Total remaining size: ${Math.round(totalSize / 1024)}KB`);
             }
         } catch (error) {
             console.error('[Logger] Error cleaning up old logs:', error);

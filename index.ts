@@ -997,12 +997,20 @@ async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
 
                             fetch.once('error', (err: any) => {
                                 logger.error('[IMAP] Fetch error:', err);
+
+                                // CRITICAL: Remove all event listeners to prevent memory leaks
+                                fetch.removeAllListeners();
+
                                 imap.end();
                                 reject(err);
                             });
 
                             fetch.once('end', () => {
                                 logger.info(`[IMAP] Fetch completed. Processed ${processedCount}/${totalMessages} messages`);
+
+                                // CRITICAL: Remove all event listeners to prevent memory leaks
+                                fetch.removeAllListeners();
+
                                 setTimeout(() => {
                                     imap.end();
                                 }, 1000);
@@ -1173,6 +1181,32 @@ async function main() {
     updateChecker.config.getQueueSize = getQueueSize;
     updateChecker.config.stopPolling = stopPolling;
     updateChecker.start();
+
+    // Start memory monitoring (every 60 seconds)
+    log('[Agent] Starting memory monitor (interval: 60s, limit: 512MB)...');
+    const MEMORY_LIMIT_MB = 512;
+    const MEMORY_WARNING_THRESHOLD = 0.8; // 80% of limit
+
+    setInterval(() => {
+        const usage = process.memoryUsage();
+        const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
+        const rssMB = Math.round(usage.rss / 1024 / 1024);
+        const queueSize = getQueueSize();
+
+        // Log memory stats
+        logger.info(`[Memory] Heap: ${heapUsedMB}MB / ${heapTotalMB}MB, RSS: ${rssMB}MB, Queue: ${queueSize}`);
+
+        // Warning if approaching memory limit
+        if (rssMB > MEMORY_LIMIT_MB * MEMORY_WARNING_THRESHOLD) {
+            logger.warn(`[Memory] WARNING: Memory usage (${rssMB}MB) approaching limit (${MEMORY_LIMIT_MB}MB)!`);
+        }
+
+        // Critical alert if exceeding limit
+        if (rssMB > MEMORY_LIMIT_MB) {
+            logger.error(`[Memory] CRITICAL: Memory usage (${rssMB}MB) exceeded limit (${MEMORY_LIMIT_MB}MB)!`);
+        }
+    }, 60000); // Every 60 seconds
 
     // Main polling loop
     log('[Agent] Starting polling loop...');
