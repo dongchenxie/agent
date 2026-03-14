@@ -34,6 +34,16 @@ print_info() {
     echo -e "${YELLOW}→ $1${NC}"
 }
 
+run_sudo() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@"
+    elif [ -n "$AGENT_SUDO_PASSWORD" ]; then
+        echo "$AGENT_SUDO_PASSWORD" | sudo -S -p '' "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then
     print_error "Please do not run this script as root"
@@ -76,16 +86,16 @@ else
         case $DISTRO in
             ubuntu|debian)
                 print_info "Installing Git on Ubuntu/Debian..."
-                sudo apt-get update
-                sudo apt-get install -y git
+                run_sudo apt-get update
+                run_sudo apt-get install -y git
                 ;;
             centos|rhel|fedora)
                 print_info "Installing Git on CentOS/RHEL/Fedora..."
-                sudo yum install -y git
+                run_sudo yum install -y git
                 ;;
             arch)
                 print_info "Installing Git on Arch Linux..."
-                sudo pacman -S --noconfirm git
+                run_sudo pacman -S --noconfirm git
                 ;;
             *)
                 print_error "Unsupported Linux distribution: $DISTRO"
@@ -130,16 +140,16 @@ else
         case $DISTRO in
             ubuntu|debian)
                 print_info "Installing unzip on Ubuntu/Debian..."
-                sudo apt-get update
-                sudo apt-get install -y unzip
+                run_sudo apt-get update
+                run_sudo apt-get install -y unzip
                 ;;
             centos|rhel|fedora)
                 print_info "Installing unzip on CentOS/RHEL/Fedora..."
-                sudo yum install -y unzip
+                run_sudo yum install -y unzip
                 ;;
             arch)
                 print_info "Installing unzip on Arch Linux..."
-                sudo pacman -S --noconfirm unzip
+                run_sudo pacman -S --noconfirm unzip
                 ;;
             *)
                 print_error "Unsupported Linux distribution: $DISTRO"
@@ -198,8 +208,12 @@ REPO_URL="https://github.com/dongchenxie/agent.git"
 
 if [ -d "$INSTALL_DIR" ]; then
     print_info "Directory $INSTALL_DIR already exists"
-    read -p "Do you want to overwrite it? (y/N): " -n 1 -r < /dev/tty
-    echo
+    if [ -n "$AGENT_OVERWRITE_EXISTING" ]; then
+        REPLY="y"
+    else
+        read -p "Do you want to overwrite it? (y/N): " -n 1 -r < /dev/tty
+        echo
+    fi
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"
         print_success "Removed existing directory"
@@ -234,14 +248,19 @@ print_info "Please provide the following configuration:"
 echo ""
 
 # Master URL
-read -p "Master Server URL (e.g., https://your-server.com:9988): " MASTER_URL < /dev/tty
+MASTER_URL=${AGENT_MASTER_URL:-$MASTER_URL}
+if [ -z "$MASTER_URL" ]; then
+    read -p "Master Server URL (e.g., https://your-server.com:9988): " MASTER_URL < /dev/tty
+fi
 while [ -z "$MASTER_URL" ]; do
     print_error "Master URL cannot be empty"
     read -p "Master Server URL: " MASTER_URL < /dev/tty
 done
 
 # Agent Secret
-read -p "Agent Secret (from server .env): " AGENT_SECRET < /dev/tty
+if [ -z "$AGENT_SECRET" ]; then
+    read -p "Agent Secret (from server .env): " AGENT_SECRET < /dev/tty
+fi
 while [ -z "$AGENT_SECRET" ]; do
     print_error "Agent Secret cannot be empty"
     read -p "Agent Secret: " AGENT_SECRET < /dev/tty
@@ -249,8 +268,10 @@ done
 
 # Agent Nickname
 DEFAULT_NICKNAME="agent-$(hostname)-$(date +%s)"
-read -p "Agent Nickname (default: $DEFAULT_NICKNAME): " AGENT_NICKNAME < /dev/tty
-AGENT_NICKNAME=${AGENT_NICKNAME:-$DEFAULT_NICKNAME}
+if [ -z "$AGENT_NICKNAME" ]; then
+    read -p "Agent Nickname (default: $DEFAULT_NICKNAME): " AGENT_NICKNAME < /dev/tty
+    AGENT_NICKNAME=${AGENT_NICKNAME:-$DEFAULT_NICKNAME}
+fi
 
 # Create .env file
 cat > .env << EOF
@@ -266,15 +287,27 @@ print_success "Configuration saved to .env"
 if [ "$OS" == "linux" ]; then
     print_header "Step 5: Setting up systemd service"
 
-    read -p "Do you want to set up auto-restart with systemd? (Y/n): " -n 1 -r < /dev/tty
-    echo
+    if [ -n "$AGENT_AUTO_SETUP_SERVICE" ]; then
+        REPLY="y"
+    else
+        read -p "Do you want to set up auto-restart with systemd? (Y/n): " -n 1 -r < /dev/tty
+        echo
+    fi
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         SERVICE_NAME="email-loop-agent"
         SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+        SERVICE_TEMP_FILE="$(mktemp)"
 
         print_info "Creating systemd service..."
 
-        sudo tee "$SERVICE_FILE" > /dev/null << EOF
+        # Recover from a previously masked unit (often a symlink to /dev/null).
+        if run_sudo test -L "$SERVICE_FILE" && [ "$(run_sudo readlink "$SERVICE_FILE" 2>/dev/null)" = "/dev/null" ]; then
+            print_info "Existing service is masked, removing mask..."
+            run_sudo rm -f "$SERVICE_FILE"
+        fi
+        run_sudo systemctl unmask "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+        cat > "$SERVICE_TEMP_FILE" << EOF
 [Unit]
 Description=Email Loop Agent
 After=network.target
@@ -294,24 +327,31 @@ SyslogIdentifier=email-loop-agent
 WantedBy=multi-user.target
 EOF
 
-        sudo systemctl daemon-reload
-        sudo systemctl enable "$SERVICE_NAME"
+        run_sudo mv "$SERVICE_TEMP_FILE" "$SERVICE_FILE"
+        run_sudo chmod 644 "$SERVICE_FILE"
+
+        run_sudo systemctl daemon-reload
+        run_sudo systemctl enable "$SERVICE_NAME"
 
         print_success "Systemd service created: $SERVICE_NAME"
         print_info "Service will auto-restart on failure"
 
-        read -p "Do you want to start the service now? (Y/n): " -n 1 -r < /dev/tty
-        echo
+        if [ -n "$AGENT_AUTO_START_SERVICE" ]; then
+            REPLY="y"
+        else
+            read -p "Do you want to start the service now? (Y/n): " -n 1 -r < /dev/tty
+            echo
+        fi
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            sudo systemctl start "$SERVICE_NAME"
+            run_sudo systemctl start "$SERVICE_NAME"
             print_success "Service started"
 
             echo ""
             print_info "Useful commands:"
-            echo "  - Check status: sudo systemctl status $SERVICE_NAME"
-            echo "  - View logs: sudo journalctl -u $SERVICE_NAME -f"
-            echo "  - Stop service: sudo systemctl stop $SERVICE_NAME"
-            echo "  - Restart service: sudo systemctl restart $SERVICE_NAME"
+            echo "  - Check status: systemctl status $SERVICE_NAME"
+            echo "  - View logs: journalctl -u $SERVICE_NAME -f"
+            echo "  - Stop service: systemctl stop $SERVICE_NAME"
+            echo "  - Restart service: systemctl restart $SERVICE_NAME"
         fi
     else
         print_info "Skipping systemd setup"

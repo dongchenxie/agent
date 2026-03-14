@@ -48,7 +48,8 @@ else
 fi
 
 # If running through pipe (curl | bash), download and re-execute with proper stdin
-if [ "$INTERACTIVE" = false ] && [ -z "$REEXECUTED" ]; then
+# Skip this in non-interactive automation mode.
+if [ "$INTERACTIVE" = false ] && [ -z "$REEXECUTED" ] && [ -z "$AGENT_NONINTERACTIVE" ]; then
     print_info "Detected pipe mode, downloading script for interactive execution..."
 
     TEMP_SCRIPT=$(mktemp /tmp/setup-user-XXXXXX.sh)
@@ -91,6 +92,10 @@ if [ -n "$AGENT_USERNAME" ]; then
     USERNAME="$AGENT_USERNAME"
     print_info "Using username from environment: $USERNAME"
 else
+    if [ -n "$AGENT_NONINTERACTIVE" ]; then
+        print_error "AGENT_USERNAME is required in non-interactive mode"
+        exit 1
+    fi
     echo ""
     read -p "Enter username to create (default: agent): " USERNAME < /dev/tty
     USERNAME=${USERNAME:-agent}
@@ -122,6 +127,10 @@ else
         echo "$USERNAME:$AGENT_PASSWORD" | chpasswd
         print_success "Password set from environment variable"
     else
+        if [ -n "$AGENT_NONINTERACTIVE" ]; then
+            print_error "AGENT_PASSWORD is required in non-interactive mode"
+            exit 1
+        fi
         echo ""
         print_info "Please set a password for user '$USERNAME':"
         passwd "$USERNAME" < /dev/tty
