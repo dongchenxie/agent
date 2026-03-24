@@ -8,6 +8,7 @@
 import nodemailer from 'nodemailer';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
+import { createHash } from 'crypto';
 import { updateChecker } from './update-checker';
 import { logger } from './logger';
 import { LogUploader } from './log-uploader';
@@ -200,6 +201,83 @@ const EMAIL_CLIENTS = [
     'Superhuman 1.0',
 ];
 
+const EHLO_BASE_DOMAINS = [
+    'node1.mailinfra.net',
+    'node2.mailinfra.net',
+    'edge1.mailinfra.net',
+    'edge2.mailinfra.net',
+    'outbound1.mxpool.net',
+    'outbound2.mxpool.net',
+    'relay1.clientnet.net',
+    'relay2.clientnet.net',
+];
+
+type DeviceClass = 'desktop' | 'laptop' | 'mac';
+type ClientFamily = 'outlook_win' | 'outlook_mac' | 'thunderbird_win' | 'thunderbird_linux' | 'apple_mail';
+
+interface ClientProfile {
+    clientFamily: ClientFamily;
+    deviceClass: DeviceClass;
+    deviceName: string;
+    ehloNode: string;
+    ehloName: string;
+    headers: Record<string, string>;
+    postHandshakeDelayMinMs: number;
+    postHandshakeDelayMaxMs: number;
+    postSendDelayMinMs: number;
+    postSendDelayMaxMs: number;
+}
+
+const CLIENT_FAMILY_CONFIG: Record<ClientFamily, {
+    deviceClass: DeviceClass;
+    devicePrefixes: string[];
+    ehloNodePrefixes: string[];
+    ehloBaseDomains: string[];
+    handshakeProfiles: Array<{ min: number; max: number }>;
+    postSendProfiles: Array<{ min: number; max: number }>;
+}> = {
+    outlook_win: {
+        deviceClass: 'desktop',
+        devicePrefixes: ['DESKTOP', 'OFFICE-PC', 'WORKSTATION', 'WINPC'],
+        ehloNodePrefixes: ['client', 'office', 'corp', 'edge'],
+        ehloBaseDomains: ['node1.mailinfra.net', 'node2.mailinfra.net', 'edge1.mailinfra.net', 'edge2.mailinfra.net'],
+        handshakeProfiles: [{ min: 18000, max: 36000 }, { min: 24000, max: 48000 }, { min: 32000, max: 60000 }],
+        postSendProfiles: [{ min: 3000, max: 7000 }, { min: 5000, max: 10000 }, { min: 7000, max: 16000 }],
+    },
+    outlook_mac: {
+        deviceClass: 'mac',
+        devicePrefixes: ['MBP', 'IMAC', 'MACBOOK'],
+        ehloNodePrefixes: ['client', 'mbx', 'relay', 'edge'],
+        ehloBaseDomains: ['outbound1.mxpool.net', 'outbound2.mxpool.net', 'relay1.clientnet.net', 'relay2.clientnet.net'],
+        handshakeProfiles: [{ min: 18000, max: 34000 }, { min: 24000, max: 42000 }, { min: 30000, max: 54000 }],
+        postSendProfiles: [{ min: 2500, max: 6000 }, { min: 4000, max: 8000 }, { min: 6000, max: 12000 }],
+    },
+    thunderbird_win: {
+        deviceClass: 'desktop',
+        devicePrefixes: ['THUNDER', 'TB-WIN', 'DESKTOP', 'WINPC'],
+        ehloNodePrefixes: ['mailhost', 'relay', 'client', 'mxpool'],
+        ehloBaseDomains: ['relay1.clientnet.net', 'relay2.clientnet.net', 'node1.mailinfra.net', 'node2.mailinfra.net'],
+        handshakeProfiles: [{ min: 15000, max: 30000 }, { min: 22000, max: 42000 }, { min: 28000, max: 52000 }],
+        postSendProfiles: [{ min: 2000, max: 5000 }, { min: 3500, max: 7000 }, { min: 5000, max: 11000 }],
+    },
+    thunderbird_linux: {
+        deviceClass: 'laptop',
+        devicePrefixes: ['THINKPAD', 'NOTEBOOK', 'ELITEBOOK', 'LAPTOP'],
+        ehloNodePrefixes: ['relay', 'mailhost', 'edge', 'mxpool'],
+        ehloBaseDomains: ['relay1.clientnet.net', 'relay2.clientnet.net', 'outbound1.mxpool.net', 'outbound2.mxpool.net'],
+        handshakeProfiles: [{ min: 16000, max: 28000 }, { min: 22000, max: 38000 }, { min: 28000, max: 50000 }],
+        postSendProfiles: [{ min: 2500, max: 5500 }, { min: 4000, max: 8500 }, { min: 6000, max: 13000 }],
+    },
+    apple_mail: {
+        deviceClass: 'mac',
+        devicePrefixes: ['MBP', 'MACBOOK', 'IMAC'],
+        ehloNodePrefixes: ['mail', 'client', 'relay', 'mbx'],
+        ehloBaseDomains: ['outbound1.mxpool.net', 'outbound2.mxpool.net', 'edge1.mailinfra.net', 'edge2.mailinfra.net'],
+        handshakeProfiles: [{ min: 14000, max: 26000 }, { min: 20000, max: 34000 }, { min: 26000, max: 44000 }],
+        postSendProfiles: [{ min: 2000, max: 4500 }, { min: 3000, max: 6500 }, { min: 4500, max: 9000 }],
+    },
+};
+
 /**
  * Get a consistent X-Mailer header based on email address hash
  * Same email will always get the same client identifier
@@ -216,6 +294,120 @@ function getXMailerForEmail(email: string): string {
     // Use absolute value and modulo to get index
     const index = Math.abs(hash) % EMAIL_CLIENTS.length;
     return EMAIL_CLIENTS[index];
+}
+
+function getStableHashForEmail(email: string): string {
+    return createHash('sha256')
+        .update(email.toLowerCase().trim())
+        .digest('hex');
+}
+
+function pickStableValue<T>(hash: string, start: number, values: T[]): T {
+    const index = parseInt(hash.slice(start, start + 4), 16) % values.length;
+    return values[index];
+}
+
+function normalizeEhloLabel(value: string): string {
+    const normalized = value
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+
+    return normalized || 'agent';
+}
+
+function normalizeEhloBaseDomain(value: string): string {
+    const normalized = value
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9.-]/g, '-')
+        .replace(/\.+/g, '.')
+        .replace(/^-|-$/g, '')
+        .replace(/^\.+|\.+$/g, '');
+
+    return normalized || 'localhost.localdomain';
+}
+
+function buildDeviceName(hash: string, prefixes: string[]): string {
+    const prefix = pickStableValue(hash, 0, prefixes);
+    const suffix = hash.slice(0, 6).toUpperCase();
+    return `${prefix}-${suffix}`;
+}
+
+function getHeadersForClientFamily(clientFamily: ClientFamily, email: string, hash: string): Record<string, string> {
+    const headers: Record<string, string> = {};
+
+    if (clientFamily === 'outlook_win') {
+        headers['X-Mailer'] = pickStableValue(hash, 4, [
+            'Microsoft Outlook 16.0',
+            'Microsoft Outlook 2019',
+            'Microsoft Outlook 16.0.14326.20404',
+        ]);
+        if (parseInt(hash.slice(20, 22), 16) % 3 === 0) {
+            headers['Importance'] = 'normal';
+        }
+    } else if (clientFamily === 'outlook_mac') {
+        headers['X-Mailer'] = pickStableValue(hash, 4, [
+            'Microsoft Outlook 16.0',
+            'Microsoft Outlook for Mac 16.78',
+            'Microsoft Outlook for Mac 16.80',
+        ]);
+    } else if (clientFamily === 'thunderbird_win' || clientFamily === 'thunderbird_linux') {
+        headers['X-Mailer'] = pickStableValue(hash, 4, [
+            'Mozilla Thunderbird 102.0',
+            'Thunderbird 102.3.0',
+            'Mozilla Thunderbird 91.0',
+        ]);
+        if (parseInt(hash.slice(22, 24), 16) % 4 === 0) {
+            headers['X-Priority'] = '3';
+        }
+    } else {
+        headers['X-Mailer'] = pickStableValue(hash, 4, [
+            'Apple Mail (16.0)',
+            'Apple Mail (15.0)',
+            'Apple Mail (2.3654.60.1)',
+        ]);
+    }
+
+    if (!headers['X-Mailer']) {
+        headers['X-Mailer'] = getXMailerForEmail(email);
+    }
+
+    return headers;
+}
+
+function getClientProfileForSmtpEmail(email: string): ClientProfile {
+    const hash = getStableHashForEmail(email);
+    const clientFamily = pickStableValue<ClientFamily>(hash, 8, [
+        'outlook_win',
+        'outlook_win',
+        'outlook_mac',
+        'thunderbird_win',
+        'thunderbird_linux',
+        'apple_mail',
+    ]);
+    const familyConfig = CLIENT_FAMILY_CONFIG[clientFamily];
+    const deviceName = buildDeviceName(hash, familyConfig.devicePrefixes);
+    const ehloNode = pickStableValue(hash, 16, familyConfig.ehloNodePrefixes);
+    const baseDomain = pickStableValue(hash, 24, familyConfig.ehloBaseDomains);
+    const ehloName = `${normalizeEhloLabel(deviceName.toLowerCase())}.${normalizeEhloLabel(ehloNode)}.${normalizeEhloBaseDomain(baseDomain)}`;
+
+    const handshakeVariant = parseInt(hash.slice(28, 30), 16) % familyConfig.handshakeProfiles.length;
+    const sendVariant = parseInt(hash.slice(30, 32), 16) % familyConfig.postSendProfiles.length;
+
+    return {
+        clientFamily,
+        deviceClass: familyConfig.deviceClass,
+        deviceName,
+        ehloNode,
+        ehloName,
+        headers: getHeadersForClientFamily(clientFamily, email, hash),
+        postHandshakeDelayMinMs: familyConfig.handshakeProfiles[handshakeVariant].min,
+        postHandshakeDelayMaxMs: familyConfig.handshakeProfiles[handshakeVariant].max,
+        postSendDelayMinMs: familyConfig.postSendProfiles[sendVariant].min,
+        postSendDelayMaxMs: familyConfig.postSendProfiles[sendVariant].max,
+    };
 }
 
 // Configuration from environment
@@ -730,6 +922,21 @@ async function sendEmail(task: Task): Promise<TaskResult> {
         const authType = smtp.authType || 'basic';
         const smtpHost = smtp.host || (authType === 'oauth2' ? 'smtp.office365.com' : 'smtp.gmail.com');
         const smtpPort = smtp.port || 587;
+        const clientProfile = getClientProfileForSmtpEmail(smtp.email);
+        const ehloName = clientProfile.ehloName;
+        const stableHeaders = clientProfile.headers;
+
+        logger.info('[Agent] SMTP client profile selected:', {
+            queueId,
+            campaignId: task.campaignId,
+            smtpEmail: smtp.email,
+            clientFamily: clientProfile.clientFamily,
+            deviceClass: clientProfile.deviceClass,
+            deviceName: clientProfile.deviceName,
+            ehloNode: clientProfile.ehloNode,
+            ehloName,
+            headers: stableHeaders
+        });
 
         // Detect AOL SMTP - AOL has strict Reply-To validation
         const isAOL = smtp.host?.includes('aol.com') || smtp.email?.includes('@aol.com');
@@ -776,6 +983,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 host: smtpHost,
                 port: smtpPort,
                 secure: isSecure,
+                name: ehloName,
                 auth: {
                     type: 'OAuth2',
                     user: smtp.email,
@@ -795,17 +1003,20 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             });
 
             // After successful SMTP login/identification, wait before sending to mimic human behavior
-            const postLoginDelayMs = Math.round(Math.random() * 15000) + 15000;
+            const postLoginDelayMs = Math.round(
+                Math.random() * (clientProfile.postHandshakeDelayMaxMs - clientProfile.postHandshakeDelayMinMs)
+            ) + clientProfile.postHandshakeDelayMinMs;
             logger.info('[Agent] Waiting after SMTP handshake before send:', {
                 queueId,
                 campaignId: task.campaignId,
                 smtpEmail: smtp.email,
-                postLoginDelayMs
+                postLoginDelayMs,
+                clientFamily: clientProfile.clientFamily,
+                deviceName: clientProfile.deviceName
             });
             await sleep(postLoginDelayMs);
 
             // Send email
-            const xMailer = getXMailerForEmail(smtp.email);
             const mailSendStart = Date.now();
 
             const sendResult = await transporter.sendMail({
@@ -814,10 +1025,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 subject,
                 html: body,
                 replyTo: finalReplyTo,
-                headers: {
-                    'X-Mailer': xMailer,
-                    'X-Priority': '3',
-                }
+                headers: stableHeaders
             });
             const sendMailMs = getDurationMs(mailSendStart);
             const totalMs = getDurationMs(sendStart);
@@ -829,6 +1037,11 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 to: contact.email,
                 from: smtp.email,
                 replyTo: finalReplyTo,
+                ehloNode: clientProfile.ehloNode,
+                ehloName,
+                clientFamily: clientProfile.clientFamily,
+                deviceName: clientProfile.deviceName,
+                headers: stableHeaders,
                 isAOL,
                 messageId: sendResult.messageId,
                 response: sendResult.response,
@@ -840,7 +1053,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             });
 
             // Post-send delay
-            await randomDelay(2000, 5000);
+            await randomDelay(clientProfile.postSendDelayMinMs, clientProfile.postSendDelayMaxMs);
 
             log(`[Agent] Sent email to ${contact.email} via ${smtp.email} (OAuth2)`);
 
@@ -862,6 +1075,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 port: smtpPort,
                 secure: isSecure,
                 requireTLS: !isSecure,
+                name: ehloName,
                 auth: {
                     user: smtp.email,
                     pass: smtp.password
@@ -883,17 +1097,20 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             });
 
             // After successful SMTP login/identification, wait before sending to mimic human behavior
-            const postLoginDelayMs = Math.round(Math.random() * 15000) + 15000;
+            const postLoginDelayMs = Math.round(
+                Math.random() * (clientProfile.postHandshakeDelayMaxMs - clientProfile.postHandshakeDelayMinMs)
+            ) + clientProfile.postHandshakeDelayMinMs;
             logger.info('[Agent] Waiting after SMTP handshake before send:', {
                 queueId,
                 campaignId: task.campaignId,
                 smtpEmail: smtp.email,
-                postLoginDelayMs
+                postLoginDelayMs,
+                clientFamily: clientProfile.clientFamily,
+                deviceName: clientProfile.deviceName
             });
             await sleep(postLoginDelayMs);
 
             // Send email
-            const xMailer = getXMailerForEmail(smtp.email);
             const mailSendStart = Date.now();
 
             const sendResult = await transporter.sendMail({
@@ -902,10 +1119,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 subject,
                 html: body,
                 replyTo: finalReplyTo,
-                headers: {
-                    'X-Mailer': xMailer,
-                    'X-Priority': '3',
-                }
+                headers: stableHeaders
             });
             const sendMailMs = getDurationMs(mailSendStart);
             const totalMs = getDurationMs(sendStart);
@@ -917,6 +1131,11 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 to: contact.email,
                 from: smtp.email,
                 replyTo: finalReplyTo,
+                ehloNode: clientProfile.ehloNode,
+                ehloName,
+                clientFamily: clientProfile.clientFamily,
+                deviceName: clientProfile.deviceName,
+                headers: stableHeaders,
                 isAOL,
                 messageId: sendResult.messageId,
                 response: sendResult.response,
@@ -929,7 +1148,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             });
 
             // Post-send delay
-            await randomDelay(2000, 5000);
+            await randomDelay(clientProfile.postSendDelayMinMs, clientProfile.postSendDelayMaxMs);
 
             log(`[Agent] Sent email to ${contact.email} via ${smtp.email} (Basic Auth)`);
 
