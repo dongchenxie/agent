@@ -400,6 +400,38 @@ function randomDelay(minMs: number, maxMs: number): Promise<void> {
     return sleep(delay);
 }
 
+function getDurationMs(startTime: number): number {
+    return Date.now() - startTime;
+}
+
+async function verifySmtpConnection(
+    transporter: nodemailer.Transporter,
+    context: {
+        queueId: number;
+        campaignId: number;
+        smtpEmail: string;
+        smtpHost: string;
+        smtpPort: number;
+        authType: string;
+    }
+): Promise<number> {
+    const verifyStart = Date.now();
+    await transporter.verify();
+    const handshakeMs = getDurationMs(verifyStart);
+
+    logger.info('[Agent] SMTP handshake verified:', {
+        queueId: context.queueId,
+        campaignId: context.campaignId,
+        smtpEmail: context.smtpEmail,
+        smtpHost: context.smtpHost,
+        smtpPort: context.smtpPort,
+        authType: context.authType,
+        handshakeMs
+    });
+
+    return handshakeMs;
+}
+
 // Get OAuth2 access token for Microsoft
 async function getOAuth2AccessToken(clientId: string, refreshToken: string): Promise<string | null> {
     try {
@@ -672,6 +704,7 @@ async function sendHealthCheck(): Promise<boolean> {
 // Send a single email with human-like behavior
 async function sendEmail(task: Task): Promise<TaskResult> {
     const { queueId, contact, campaign, smtp, subject, body, trackingId } = task;
+    const sendStart = Date.now();
 
     try {
         // Use pre-generated content from master
@@ -695,6 +728,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
 
         const isSecure = smtp.secure === true;
         const authType = smtp.authType || 'basic';
+        const smtpHost = smtp.host || (authType === 'oauth2' ? 'smtp.office365.com' : 'smtp.gmail.com');
+        const smtpPort = smtp.port || 587;
 
         // Detect AOL SMTP - AOL has strict Reply-To validation
         const isAOL = smtp.host?.includes('aol.com') || smtp.email?.includes('@aol.com');
@@ -738,8 +773,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
 
             // Use nodemailer with OAuth2 XOAUTH2
             const transportConfig = {
-                host: smtp.host || 'smtp.office365.com',
-                port: smtp.port || 587,
+                host: smtpHost,
+                port: smtpPort,
                 secure: isSecure,
                 auth: {
                     type: 'OAuth2',
@@ -750,11 +785,28 @@ async function sendEmail(task: Task): Promise<TaskResult> {
 
             const transporter = nodemailer.createTransport(transportConfig as nodemailer.TransportOptions);
 
-            // Simulate human-like delays during connection
-            await randomDelay(1000, 3000); // Initial connection delay
+            const handshakeMs = await verifySmtpConnection(transporter, {
+                queueId,
+                campaignId: task.campaignId,
+                smtpEmail: smtp.email,
+                smtpHost,
+                smtpPort,
+                authType
+            });
+
+            // After successful SMTP login/identification, wait before sending to mimic human behavior
+            const postLoginDelayMs = Math.round(Math.random() * 15000) + 15000;
+            logger.info('[Agent] Waiting after SMTP handshake before send:', {
+                queueId,
+                campaignId: task.campaignId,
+                smtpEmail: smtp.email,
+                postLoginDelayMs
+            });
+            await sleep(postLoginDelayMs);
 
             // Send email
             const xMailer = getXMailerForEmail(smtp.email);
+            const mailSendStart = Date.now();
 
             const sendResult = await transporter.sendMail({
                 from: smtp.email,
@@ -767,6 +819,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                     'X-Priority': '3',
                 }
             });
+            const sendMailMs = getDurationMs(mailSendStart);
+            const totalMs = getDurationMs(sendStart);
 
             // Log SMTP response details
             logger.info(`[Agent] SMTP accepted email (OAuth2):`, {
@@ -779,7 +833,10 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 messageId: sendResult.messageId,
                 response: sendResult.response,
                 accepted: sendResult.accepted,
-                rejected: sendResult.rejected
+                rejected: sendResult.rejected,
+                handshakeMs,
+                sendMailMs,
+                totalMs
             });
 
             // Post-send delay
@@ -801,8 +858,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             log(`[Agent] Using basic authentication for ${smtp.email}`);
 
             const transportConfig = {
-                host: smtp.host || 'smtp.gmail.com',
-                port: smtp.port || 587,
+                host: smtpHost,
+                port: smtpPort,
                 secure: isSecure,
                 requireTLS: !isSecure,
                 auth: {
@@ -816,11 +873,28 @@ async function sendEmail(task: Task): Promise<TaskResult> {
 
             const transporter = nodemailer.createTransport(transportConfig as nodemailer.TransportOptions);
 
-            // Simulate human-like delays
-            await randomDelay(1000, 3000); // Initial connection delay
+            const handshakeMs = await verifySmtpConnection(transporter, {
+                queueId,
+                campaignId: task.campaignId,
+                smtpEmail: smtp.email,
+                smtpHost,
+                smtpPort,
+                authType
+            });
+
+            // After successful SMTP login/identification, wait before sending to mimic human behavior
+            const postLoginDelayMs = Math.round(Math.random() * 15000) + 15000;
+            logger.info('[Agent] Waiting after SMTP handshake before send:', {
+                queueId,
+                campaignId: task.campaignId,
+                smtpEmail: smtp.email,
+                postLoginDelayMs
+            });
+            await sleep(postLoginDelayMs);
 
             // Send email
             const xMailer = getXMailerForEmail(smtp.email);
+            const mailSendStart = Date.now();
 
             const sendResult = await transporter.sendMail({
                 from: smtp.email,
@@ -833,6 +907,8 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                     'X-Priority': '3',
                 }
             });
+            const sendMailMs = getDurationMs(mailSendStart);
+            const totalMs = getDurationMs(sendStart);
 
             // Log SMTP response details
             logger.info(`[Agent] SMTP accepted email (Basic Auth):`, {
@@ -846,7 +922,10 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 response: sendResult.response,
                 accepted: sendResult.accepted,
                 rejected: sendResult.rejected,
-                pending: sendResult.pending
+                pending: sendResult.pending,
+                handshakeMs,
+                sendMailMs,
+                totalMs
             });
 
             // Post-send delay
@@ -874,6 +953,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
             to: contact.email,
             from: smtp.email,
             error: errorMessage,
+            totalMs: getDurationMs(sendStart),
             errorStack: error instanceof Error ? error.stack : undefined
         });
 
