@@ -544,6 +544,7 @@ interface TaskResult {
     smtpId: number;
     smtpEmail: string;
     success: boolean;
+    smtpResponse?: string;
     trackingId?: string;
     subject?: string;
     body?: string;
@@ -1062,6 +1063,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 smtpId: smtp.id,
                 smtpEmail: smtp.email,
                 success: true,
+                smtpResponse: sendResult.response,
                 trackingId,
                 subject,
                 body
@@ -1157,6 +1159,7 @@ async function sendEmail(task: Task): Promise<TaskResult> {
                 smtpId: smtp.id,
                 smtpEmail: smtp.email,
                 success: true,
+                smtpResponse: sendResult.response,
                 trackingId,
                 subject,
                 body
