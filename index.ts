@@ -442,15 +442,18 @@ let config = {
 
 // Queue management
 let currentQueue: Task[] = [];
+let smtpTestQueue: SmtpTestTask[] = [];
 let isPollingEnabled = true;
 let isShuttingDown = false;
 let isProcessing = false; // Track if currently processing tasks
+let isProcessingSmtpTests = false;
+let isSendingEmail = false;
 
 /**
  * Get current queue size
  */
 function getQueueSize(): number {
-    return currentQueue.length;
+    return currentQueue.length + smtpTestQueue.length;
 }
 
 /**
@@ -458,7 +461,7 @@ function getQueueSize(): number {
  */
 function stopPolling(): void {
     isPollingEnabled = false;
-    log('[Agent] Polling stopped - no new tasks will be fetched');
+    log('[Agent] Polling stopped - no new campaign or SMTP test tasks will be fetched');
 }
 
 /**
@@ -477,14 +480,14 @@ async function gracefulShutdown(signal: string): Promise<void> {
     stopPolling();
 
     // Wait for all work to complete (queue empty AND not processing)
-    if (currentQueue.length > 0 || isProcessing) {
+    if (currentQueue.length > 0 || smtpTestQueue.length > 0 || isProcessing || isProcessingSmtpTests || isSendingEmail) {
         log(`[Agent] Waiting for work to complete...`);
-        log(`[Agent] Queue size: ${currentQueue.length}, Processing: ${isProcessing}`);
+        log(`[Agent] Campaign queue: ${currentQueue.length}, SMTP test queue: ${smtpTestQueue.length}, Processing campaigns: ${isProcessing}, Processing SMTP tests: ${isProcessingSmtpTests}, Sending: ${isSendingEmail}`);
 
-        while (currentQueue.length > 0 || isProcessing) {
+        while (currentQueue.length > 0 || smtpTestQueue.length > 0 || isProcessing || isProcessingSmtpTests || isSendingEmail) {
             await sleep(1000);
-            if (currentQueue.length > 0 || isProcessing) {
-                log(`[Agent] Queue size: ${currentQueue.length}, Processing: ${isProcessing}`);
+            if (currentQueue.length > 0 || smtpTestQueue.length > 0 || isProcessing || isProcessingSmtpTests || isSendingEmail) {
+                log(`[Agent] Campaign queue: ${currentQueue.length}, SMTP test queue: ${smtpTestQueue.length}, Processing campaigns: ${isProcessing}, Processing SMTP tests: ${isProcessingSmtpTests}, Sending: ${isSendingEmail}`);
             }
         }
 
@@ -505,7 +508,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
 interface Task {
     queueId: number;
-    campaignId: number;
+    campaignId: number | null;
     // Pre-generated email content from master
     subject: string;
     body: string;
@@ -521,7 +524,7 @@ interface Task {
     campaign: {
         name: string;
         replyTo?: string;
-    };
+    } | null;
     smtp: {
         id: number;
         email: string;
@@ -549,6 +552,40 @@ interface TaskResult {
     subject?: string;
     body?: string;
     errorMessage?: string;
+}
+
+interface SmtpTestTask {
+    recipientId: number;
+    runId: number;
+    subject: string;
+    body: string;
+    recipientEmail: string;
+    smtp: {
+        id: number;
+        email: string;
+        password: string;
+        host?: string;
+        port?: number;
+        secure?: boolean;
+        authType?: string;
+        clientId?: string;
+        clientSecret?: string;
+        refreshToken?: string;
+        tenantId?: string;
+        accessToken?: string;
+        tokenExpiresAt?: string;
+    };
+}
+
+interface SmtpTestTaskResult {
+    recipientId: number;
+    runId: number;
+    smtpId: number;
+    smtpEmail: string;
+    success: boolean;
+    smtpResponse?: string;
+    errorMessage?: string;
+    sentAt?: string;
 }
 
 interface ImapTask {
@@ -597,11 +634,25 @@ function getDurationMs(startTime: number): number {
     return Date.now() - startTime;
 }
 
+async function runExclusiveEmailSend<T>(label: string, work: () => Promise<T>): Promise<T> {
+    while (isSendingEmail) {
+        logger.info(`[Agent] Waiting for active email send lock before ${label}...`);
+        await sleep(500);
+    }
+
+    isSendingEmail = true;
+    try {
+        return await work();
+    } finally {
+        isSendingEmail = false;
+    }
+}
+
 async function verifySmtpConnection(
     transporter: nodemailer.Transporter,
     context: {
         queueId: number;
-        campaignId: number;
+        campaignId: number | null;
         smtpEmail: string;
         smtpHost: string;
         smtpPort: number;
@@ -743,6 +794,46 @@ async function poll(): Promise<Task[]> {
     }
 }
 
+// Poll for SMTP test tasks
+async function pollSmtpTests(): Promise<SmtpTestTask[]> {
+    if (!agentToken) {
+        console.error('[Agent] Not registered, cannot poll SMTP test tasks');
+        return [];
+    }
+
+    try {
+        const baseUrl = MASTER_URL.replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/agents/poll-smtp-tests`, {
+            method: 'GET',
+            headers: {
+                'X-Agent-Token': agentToken,
+                'X-Agent-Version': VERSION,
+                'X-Custom-Agent': 'RankScaleAIEmailAgent'
+            }
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            console.error(`[Agent] SMTP test poll failed: ${error.error}`);
+
+            if (response.status === 401) {
+                agentToken = null;
+            }
+            return [];
+        }
+
+        const data = await response.json();
+        if (data.config) {
+            config = { ...config, ...data.config };
+        }
+
+        return data.tasks || [];
+    } catch (error) {
+        console.error('[Agent] SMTP test poll error:', error);
+        return [];
+    }
+}
+
 // Report results to master with retry mechanism
 async function report(results: TaskResult[]): Promise<boolean> {
     if (!agentToken || results.length === 0) return true;
@@ -809,6 +900,60 @@ async function report(results: TaskResult[]): Promise<boolean> {
                     error: r.errorMessage
                 }))
             });
+            return false;
+        }
+    }
+
+    return false;
+}
+
+async function reportSmtpTests(results: SmtpTestTaskResult[]): Promise<boolean> {
+    if (!agentToken || results.length === 0) return true;
+
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 30000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            logger.info(`[Agent] Reporting ${results.length} SMTP test result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
+
+            const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const response = await fetch(`${baseUrl}/api/agents/report-smtp-tests`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Agent-Token': agentToken,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                },
+                body: JSON.stringify({ results })
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                logger.error(`[Agent] SMTP test report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`);
+
+                if (attempt < MAX_RETRIES) {
+                    logger.warn(`[Agent] Retrying SMTP test report in ${RETRY_DELAY / 1000} seconds...`);
+                    await sleep(RETRY_DELAY);
+                    continue;
+                }
+
+                logger.error('[Agent] SMTP test report failed after maximum retries. Results will be lost.');
+                return false;
+            }
+
+            logger.info(`[Agent] Successfully reported ${results.length} SMTP test result(s) to master`);
+            return true;
+        } catch (error) {
+            logger.error(`[Agent] SMTP test report error (attempt ${attempt}/${MAX_RETRIES}):`, error);
+
+            if (attempt < MAX_RETRIES) {
+                logger.warn(`[Agent] Retrying SMTP test report in ${RETRY_DELAY / 1000} seconds...`);
+                await sleep(RETRY_DELAY);
+                continue;
+            }
+
+            logger.error('[Agent] SMTP test report failed after maximum retries due to network error.');
             return false;
         }
     }
@@ -1189,6 +1334,35 @@ async function sendEmail(task: Task): Promise<TaskResult> {
     }
 }
 
+async function sendSmtpTestEmail(task: SmtpTestTask): Promise<SmtpTestTaskResult> {
+    const syntheticTask = {
+        queueId: task.recipientId,
+        campaignId: null,
+        subject: task.subject,
+        body: task.body,
+        trackingId: `smtp-test-run-${task.runId}-recipient-${task.recipientId}`,
+        contact: {
+            id: task.recipientId,
+            email: task.recipientEmail
+        },
+        campaign: null,
+        smtp: task.smtp
+    } as Task;
+
+    const result = await sendEmail(syntheticTask);
+
+    return {
+        recipientId: task.recipientId,
+        runId: task.runId,
+        smtpId: result.smtpId,
+        smtpEmail: result.smtpEmail,
+        success: result.success,
+        smtpResponse: result.smtpResponse,
+        errorMessage: result.errorMessage,
+        sentAt: result.success ? new Date().toISOString() : undefined
+    };
+}
+
 // Check IMAP for new emails - agent directly connects to IMAP server
 async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
     const { accountId, email, imapConfig } = task;
@@ -1444,6 +1618,82 @@ async function imapPollingLoop() {
     }
 }
 
+async function smtpTestPollingLoop() {
+    log('[Agent] SMTP test polling loop started');
+
+    while (true) {
+        try {
+            if (!isPollingEnabled) {
+                if (smtpTestQueue.length > 0) {
+                    isProcessingSmtpTests = true;
+                    log('[Agent] SMTP test polling is disabled, processing remaining SMTP test queue...');
+                    const task = smtpTestQueue.shift()!;
+                    const result = await runExclusiveEmailSend(
+                        `SMTP test recipient ${task.recipientId}`,
+                        () => sendSmtpTestEmail(task)
+                    );
+
+                    const reportSuccess = await reportSmtpTests([result]);
+                    if (!reportSuccess) {
+                        logger.warn('[Agent] Failed to report SMTP test result after retries, but continuing with remaining SMTP test queue');
+                    }
+
+                    isProcessingSmtpTests = false;
+
+                    if (smtpTestQueue.length > 0) {
+                        await sleep(config.sendInterval);
+                    }
+                } else if (!isProcessingSmtpTests) {
+                    break;
+                }
+
+                await sleep(1000);
+                continue;
+            }
+
+            const tasks = await pollSmtpTests();
+            if (tasks.length > 0) {
+                isProcessingSmtpTests = true;
+                smtpTestQueue.push(...tasks);
+                log(`[Agent] Received ${tasks.length} SMTP test task(s)`);
+
+                const results: SmtpTestTaskResult[] = [];
+                for (const task of tasks) {
+                    const result = await runExclusiveEmailSend(
+                        `SMTP test recipient ${task.recipientId}`,
+                        () => sendSmtpTestEmail(task)
+                    );
+                    results.push(result);
+
+                    const index = smtpTestQueue.indexOf(task);
+                    if (index > -1) {
+                        smtpTestQueue.splice(index, 1);
+                    }
+
+                    if (tasks.indexOf(task) < tasks.length - 1) {
+                        await sleep(config.sendInterval);
+                    }
+                }
+
+                const reportSuccess = await reportSmtpTests(results);
+                isProcessingSmtpTests = false;
+
+                if (reportSuccess) {
+                    log(`[Agent] Completed ${results.length} SMTP test task(s), ${results.filter(r => r.success).length} successful`);
+                } else {
+                    log(`[Agent] Completed ${results.length} SMTP test task(s), ${results.filter(r => r.success).length} successful, but failed to report to master after retries`);
+                }
+            }
+
+            await sleep(config.pollInterval);
+        } catch (error) {
+            logger.error('[Agent] SMTP test polling loop error:', error);
+            isProcessingSmtpTests = false;
+            await sleep(10000);
+        }
+    }
+}
+
 // Main loop
 async function main() {
     log(`[Agent] Email Loop Agent v${VERSION}`);
@@ -1477,6 +1727,10 @@ async function main() {
     // Start IMAP polling loop in background
     log(`[Agent] Starting IMAP polling loop (interval: ${config.pollInterval}ms)...`);
     imapPollingLoop().catch(console.error);
+
+    // Start SMTP test polling loop in background
+    log(`[Agent] Starting SMTP test polling loop (interval: ${config.pollInterval}ms)...`);
+    smtpTestPollingLoop().catch(console.error);
 
     // Start update checker
     log('[Agent] Starting auto-update checker...');
@@ -1524,7 +1778,10 @@ async function main() {
                     isProcessing = true;
                     log('[Agent] Polling is disabled, processing remaining queue...');
                     const task = currentQueue.shift()!;
-                    const result = await sendEmail(task);
+                    const result = await runExclusiveEmailSend(
+                        `campaign queue item ${task.queueId}`,
+                        () => sendEmail(task)
+                    );
 
                     // Report with retry mechanism
                     const reportSuccess = await report([result]);
@@ -1565,7 +1822,10 @@ async function main() {
 
                 // Process tasks sequentially with delay
                 for (const task of tasks) {
-                    const result = await sendEmail(task);
+                    const result = await runExclusiveEmailSend(
+                        `campaign queue item ${task.queueId}`,
+                        () => sendEmail(task)
+                    );
                     results.push(result);
 
                     // Remove from queue after processing

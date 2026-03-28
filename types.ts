@@ -44,6 +44,40 @@ export interface TaskResult {
     error?: string;
 }
 
+export interface SmtpTestTask {
+    recipientId: number;
+    runId: number;
+    subject: string;
+    body: string;
+    recipientEmail: string;
+    smtp: {
+        id: number;
+        email: string;
+        password: string;
+        host: string;
+        port: number;
+        secure: boolean;
+        authType?: string;
+        clientId?: string;
+        clientSecret?: string;
+        refreshToken?: string;
+        tenantId?: string;
+        accessToken?: string;
+        tokenExpiresAt?: string;
+    };
+}
+
+export interface SmtpTestTaskResult {
+    recipientId: number;
+    runId: number;
+    success: boolean;
+    smtpId: number;
+    smtpEmail: string;
+    smtpResponse?: string;
+    errorMessage?: string;
+    sentAt?: string;
+}
+
 export interface ImapTask {
     type: 'imap_check';
     accountId: number;

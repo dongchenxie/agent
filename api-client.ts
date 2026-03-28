@@ -14,6 +14,7 @@ import {
     updateConfig
 } from './config';
 import type { Task, TaskResult, ImapTaskResult } from './types';
+import type { SmtpTestTask, SmtpTestTaskResult } from './types';
 
 /**
  * Register agent with master server
@@ -159,6 +160,95 @@ export async function report(results: TaskResult[]): Promise<boolean> {
 
             logger.error(`[Agent] Report failed after ${MAX_RETRIES} attempts due to network error.`);
             return false;
+        }
+    }
+
+    return false;
+}
+
+export async function pollSmtpTests(): Promise<SmtpTestTask[]> {
+    const agentToken = getAgentToken();
+    if (!agentToken) {
+        logger.error('[Agent] Not registered, cannot poll SMTP test tasks');
+        return [];
+    }
+
+    try {
+        const baseUrl = MASTER_URL.replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/agents/poll-smtp-tests`, {
+            method: 'GET',
+            headers: {
+                'X-Agent-Token': agentToken,
+                'X-Agent-Version': VERSION,
+                'X-Custom-Agent': 'RankScaleAIEmailAgent'
+            }
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            logger.error(`[Agent] SMTP test poll failed: ${error.error}`);
+
+            if (response.status === 401) {
+                setAgentToken('');
+            }
+            return [];
+        }
+
+        const data = await response.json();
+        if (data.config) {
+            updateConfig(data.config);
+        }
+
+        return data.tasks || [];
+    } catch (error) {
+        logger.error('[Agent] SMTP test poll error:', error);
+        return [];
+    }
+}
+
+export async function reportSmtpTests(results: SmtpTestTaskResult[]): Promise<boolean> {
+    const agentToken = getAgentToken();
+    if (!agentToken || results.length === 0) return true;
+
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 30000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            logger.info(`[Agent] Reporting ${results.length} SMTP test result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
+
+            const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const response = await fetch(`${baseUrl}/api/agents/report-smtp-tests`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Agent-Token': agentToken,
+                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                },
+                body: JSON.stringify({ results })
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                logger.error(`[Agent] SMTP test report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`);
+
+                if (attempt < MAX_RETRIES) {
+                    logger.warn(`[Agent] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                    await sleep(RETRY_DELAY);
+                    continue;
+                }
+
+                return false;
+            }
+
+            logger.info(`[Agent] Successfully reported ${results.length} SMTP test result(s)`);
+            return true;
+        } catch (error) {
+            logger.error(`[Agent] SMTP test report error (attempt ${attempt}/${MAX_RETRIES}):`, error);
+            if (attempt < MAX_RETRIES) {
+                logger.warn(`[Agent] Retrying in ${RETRY_DELAY / 1000} seconds...`);
+                await sleep(RETRY_DELAY);
+            }
         }
     }
 
