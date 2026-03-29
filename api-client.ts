@@ -122,6 +122,13 @@ export async function report(results: TaskResult[]): Promise<boolean> {
             logger.info(`[Agent] Reporting ${results.length} result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
 
             const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const requestBody = JSON.stringify({ results });
+            logger.info(`[Agent] report REQUEST BODY (attempt ${attempt}):`, {
+                url: `${baseUrl}/api/agents/report`,
+                bodyLength: requestBody.length,
+                resultsCount: results.length,
+                body: JSON.parse(requestBody)
+            });
             const response = await fetch(`${baseUrl}/api/agents/report`, {
                 method: 'POST',
                 headers: {
@@ -129,7 +136,7 @@ export async function report(results: TaskResult[]): Promise<boolean> {
                     'X-Agent-Token': agentToken,
                     'X-Custom-Agent': 'RankScaleAIEmailAgent'
                 },
-                body: JSON.stringify({ results })
+                body: requestBody
             });
 
             if (!response.ok) {
@@ -218,6 +225,13 @@ export async function reportSmtpTests(results: SmtpTestTaskResult[]): Promise<bo
             logger.info(`[Agent] Reporting ${results.length} SMTP test result(s) to master (attempt ${attempt}/${MAX_RETRIES})`);
 
             const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const requestBody = JSON.stringify({ results });
+            logger.info(`[Agent] report-smtp-tests REQUEST BODY (attempt ${attempt}):`, {
+                url: `${baseUrl}/api/agents/report-smtp-tests`,
+                bodyLength: requestBody.length,
+                resultsCount: results.length,
+                body: JSON.parse(requestBody)
+            });
             const response = await fetch(`${baseUrl}/api/agents/report-smtp-tests`, {
                 method: 'POST',
                 headers: {
@@ -225,7 +239,7 @@ export async function reportSmtpTests(results: SmtpTestTaskResult[]): Promise<bo
                     'X-Agent-Token': agentToken,
                     'X-Custom-Agent': 'RankScaleAIEmailAgent'
                 },
-                body: JSON.stringify({ results })
+                body: requestBody
             });
 
             if (!response.ok) {
@@ -270,6 +284,13 @@ export async function reportImap(results: ImapTaskResult[]): Promise<boolean> {
             logger.info(`[IMAP] Reporting ${results.length} result(s) (attempt ${attempt}/${MAX_RETRIES})`);
 
             const baseUrl = MASTER_URL.replace(/\/$/, '');
+            const requestBody = JSON.stringify({ results });
+            logger.info(`[IMAP] report-imap REQUEST BODY (attempt ${attempt}):`, {
+                url: `${baseUrl}/api/agents/report-imap`,
+                bodyLength: requestBody.length,
+                resultsCount: results.length,
+                body: JSON.parse(requestBody)
+            });
             const response = await fetch(`${baseUrl}/api/agents/report-imap`, {
                 method: 'POST',
                 headers: {
@@ -277,12 +298,15 @@ export async function reportImap(results: ImapTaskResult[]): Promise<boolean> {
                     'X-Agent-Token': agentToken,
                     'X-Custom-Agent': 'RankScaleAIEmailAgent'
                 },
-                body: JSON.stringify({ results })
+                body: requestBody
             });
 
             if (!response.ok) {
                 const error = await response.json();
-                logger.error(`[IMAP] Report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`);
+                logger.error(`[IMAP] Report failed (attempt ${attempt}/${MAX_RETRIES}): ${error.error}`, {
+                    statusCode: response.status,
+                    errorBody: error
+                });
 
                 if (attempt < MAX_RETRIES) {
                     logger.warn(`[IMAP] Retrying in ${RETRY_DELAY / 1000} seconds...`);
@@ -349,6 +373,7 @@ export async function pollImap(): Promise<any[]> {
 
     try {
         const baseUrl = MASTER_URL.replace(/\/$/, '');
+        logger.info(`[IMAP] Polling for tasks`, { url: `${baseUrl}/api/agents/poll-imap` });
         const response = await fetch(`${baseUrl}/api/agents/poll-imap`, {
             method: 'GET',
             headers: {
@@ -359,6 +384,8 @@ export async function pollImap(): Promise<any[]> {
         });
 
         if (!response.ok) {
+            const errorBody = await response.json().catch(() => ({}));
+            logger.error(`[IMAP] Poll failed`, { statusCode: response.status, errorBody });
             if (response.status === 401) {
                 setAgentToken('');
             }
@@ -366,7 +393,12 @@ export async function pollImap(): Promise<any[]> {
         }
 
         const data = await response.json();
-        return data.tasks || [];
+        const tasks = data.tasks || [];
+        logger.info(`[IMAP] Poll response: ${tasks.length} task(s)`, {
+            tasksCount: tasks.length,
+            taskIds: tasks.map((t: any) => t.accountId)
+        });
+        return tasks;
     } catch (error) {
         logger.error(`[IMAP] Poll error:`, error);
         return [];
