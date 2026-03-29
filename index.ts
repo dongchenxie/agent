@@ -1981,25 +1981,20 @@ async function imapPollingLoop() {
                 config = { ...config, ...data.config };
             }
 
-            // Process tasks and collect results
-            const results: ImapTaskResult[] = [];
-
+            // Process tasks and report each result immediately
             for (const task of data.tasks) {
                 const result = await checkImap(task);
-                results.push(result);
+
+                // Report immediately after each task so results aren't lost on restart
+                const reportSuccess = await reportImap([result]);
+                if (!reportSuccess) {
+                    logger.warn(`[IMAP] Failed to report result for ${result.email}`);
+                }
 
                 // Task interval delay (rate limiting: controls check frequency, avoids simultaneous IMAP connections)
                 if (data.tasks.indexOf(task) < data.tasks.length - 1) {
                     logger.info(`[IMAP] Waiting ${config.sendInterval}ms before next check (rate limiting)`);
                     await sleep(config.sendInterval);
-                }
-            }
-
-            // Report all results
-            if (results.length > 0) {
-                const reportSuccess = await reportImap(results);
-                if (!reportSuccess) {
-                    logger.warn('[IMAP] Failed to report results after 5 retries');
                 }
             }
 
