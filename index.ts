@@ -1566,6 +1566,18 @@ async function checkImapOnce(
 
     return new Promise<ReceivedEmail[]>((resolve, reject) => {
         const connectStart = Date.now();
+        const connTimeout = Math.round(imapProfile.connTimeoutMs * timeoutMultiplier);
+        const authTimeout = Math.round(imapProfile.authTimeoutMs * timeoutMultiplier);
+        const socketTimeout = Math.round(imapProfile.socketTimeoutMs * timeoutMultiplier);
+
+        logger.info(`[IMAP] Connecting to ${imapConfig.host}:${imapConfig.port}`, {
+            accountId, email,
+            connTimeout, authTimeout, socketTimeout,
+            timeoutMultiplier,
+            tls: imapConfig.secure,
+            servername: imapProfile.tlsServername
+        });
+
         const imapConnectionConfig: any = {
             user: imapConfig.user,
             password: imapConfig.password,
@@ -1578,9 +1590,9 @@ async function checkImapOnce(
                 rejectUnauthorized: false,
                 minVersion: 'TLSv1.2'
             },
-            connTimeout: Math.round(imapProfile.connTimeoutMs * timeoutMultiplier),
-            authTimeout: Math.round(imapProfile.authTimeoutMs * timeoutMultiplier),
-            socketTimeout: Math.round(imapProfile.socketTimeoutMs * timeoutMultiplier),
+            connTimeout,
+            authTimeout,
+            socketTimeout,
         };
         const imap = new Imap(imapConnectionConfig);
 
@@ -1592,19 +1604,26 @@ async function checkImapOnce(
         const resolveOnce = (value: ReceivedEmail[]) => {
             if (settled) return;
             settled = true;
+            clearTimeout(hardTimer);
             resolve(value);
         };
 
         const rejectOnce = (error: Error) => {
             if (settled) return;
             settled = true;
+            clearTimeout(hardTimer);
             reject(error);
         };
 
         const endConnection = () => {
             try {
                 imap.end();
+                // Force destroy if end() doesn't close within 5s
+                setTimeout(() => {
+                    try { imap.destroy(); } catch (_) {}
+                }, 5000);
             } catch (error) {
+                try { imap.destroy(); } catch (_) {}
                 logger.warn('[IMAP] Failed to gracefully end IMAP connection:', {
                     accountId,
                     email,
@@ -1612,6 +1631,14 @@ async function checkImapOnce(
                 });
             }
         };
+
+        // Hard timeout: if the entire operation takes too long, force resolve
+        const hardTimeoutMs = connTimeout + 15000; // connTimeout + 15s buffer
+        const hardTimer = setTimeout(() => {
+            logger.warn(`[IMAP] Hard timeout after ${hardTimeoutMs}ms for ${email}`, { accountId });
+            try { imap.destroy(); } catch (_) {}
+            rejectOnce(new Error(`IMAP hard timeout after ${hardTimeoutMs}ms`));
+        }, hardTimeoutMs);
 
         imap.once('ready', () => {
             const handshakeMs = getDurationMs(connectStart);
@@ -1639,6 +1666,7 @@ async function checkImapOnce(
 
                     if (!results || results.length === 0) {
                         logger.info(`[IMAP] No new messages for ${email}`);
+                        resolveOnce(fetchedEmails);
                         endConnection();
                         return;
                     }
@@ -1711,8 +1739,10 @@ async function checkImapOnce(
                             await Promise.allSettled(messageProcessingPromises);
                             logger.info(`[IMAP] Fetch completed. Processed ${processedCount}/${totalMessages} messages`);
                             fetch.removeAllListeners();
+                            resolveOnce(fetchedEmails);
                             endConnection();
                         })().catch((fetchEndError) => {
+                            resolveOnce(fetchedEmails);
                             endConnection();
                             rejectOnce(
                                 fetchEndError instanceof Error
@@ -1745,6 +1775,7 @@ const IMAP_MAX_RETRIES = 3;
 
 async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
     const { accountId, email, imapConfig } = task;
+    const checkStart = Date.now();
     const smtpLikeClientProfile = getClientProfileForSmtpEmail(email);
     const imapProfile = getImapClientProfile(email, imapConfig.host, smtpLikeClientProfile);
 
@@ -1752,18 +1783,16 @@ async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
         accountId,
         host: imapConfig.host,
         port: imapConfig.port,
-        clientFamily: imapProfile.clientFamily,
-        deviceClass: imapProfile.deviceClass,
-        deviceName: imapProfile.deviceName,
-        localHostName: imapProfile.localHostName,
-        tlsServername: imapProfile.tlsServername,
-        identification: imapProfile.identification
+        connTimeoutMs: imapProfile.connTimeoutMs,
+        authTimeoutMs: imapProfile.authTimeoutMs,
+        connectDelayRange: `${imapProfile.connectDelayMinMs}-${imapProfile.connectDelayMaxMs}ms`
     });
 
-    // Wait for the specified delay (human-like behavior) — only once before first attempt
+    // Wait for the specified delay — only once before first attempt
     if (task.delaySeconds > 0) {
-        logger.info(`[IMAP] Waiting ${task.delaySeconds}s before checking ${email}`);
+        logger.info(`[IMAP] Pre-check delay: ${task.delaySeconds}s for ${email}`);
         await sleep(task.delaySeconds * 1000);
+        logger.info(`[IMAP] Pre-check delay done for ${email} (elapsed: ${Date.now() - checkStart}ms)`);
     }
 
     // Stable client-specific connection delay — only once before first attempt
@@ -1771,26 +1800,33 @@ async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
         imapProfile.connectDelayMinMs,
         imapProfile.connectDelayMaxMs
     );
-    logger.info(`[IMAP] Random connect delay: ${connectDelay}ms`);
+    logger.info(`[IMAP] Connect delay: ${connectDelay}ms for ${email}`);
     await sleep(connectDelay);
+    logger.info(`[IMAP] Connect delay done for ${email} (elapsed: ${Date.now() - checkStart}ms)`);
 
     let lastError: string = '';
 
     for (let attempt = 1; attempt <= IMAP_MAX_RETRIES; attempt++) {
         const timeoutMultiplier = Math.pow(2, attempt - 1); // 1x, 2x, 4x
+        const attemptStart = Date.now();
 
         try {
-            if (attempt > 1) {
-                logger.info(`[IMAP] Retry attempt ${attempt}/${IMAP_MAX_RETRIES} for ${email} (timeout x${timeoutMultiplier})`, {
-                    accountId,
-                    connTimeoutMs: Math.round(imapProfile.connTimeoutMs * timeoutMultiplier),
-                    authTimeoutMs: Math.round(imapProfile.authTimeoutMs * timeoutMultiplier)
-                });
-            }
+            logger.info(`[IMAP] Attempt ${attempt}/${IMAP_MAX_RETRIES} for ${email}`, {
+                accountId,
+                timeoutMultiplier,
+                connTimeoutMs: Math.round(imapProfile.connTimeoutMs * timeoutMultiplier),
+                authTimeoutMs: Math.round(imapProfile.authTimeoutMs * timeoutMultiplier),
+                totalElapsedMs: Date.now() - checkStart
+            });
 
             const emails = await checkImapOnce(task, imapProfile, timeoutMultiplier);
 
-            logger.info(`[IMAP] Check completed for ${email}: ${emails.length} emails fetched`);
+            logger.info(`[IMAP] Attempt ${attempt} succeeded for ${email}`, {
+                accountId,
+                emailsFetched: emails.length,
+                attemptMs: Date.now() - attemptStart,
+                totalMs: Date.now() - checkStart
+            });
 
             return {
                 accountId,
@@ -1801,12 +1837,18 @@ async function checkImap(task: ImapTask): Promise<ImapTaskResult> {
         } catch (error: any) {
             lastError = error instanceof Error ? error.message : String(error);
 
+            logger.error(`[IMAP] Attempt ${attempt}/${IMAP_MAX_RETRIES} failed for ${email}`, {
+                accountId,
+                error: lastError,
+                isTimeout: isImapTimeoutError(error),
+                attemptMs: Date.now() - attemptStart,
+                totalMs: Date.now() - checkStart,
+                willRetry: isImapTimeoutError(error) && attempt < IMAP_MAX_RETRIES
+            });
+
             if (isImapTimeoutError(error) && attempt < IMAP_MAX_RETRIES) {
-                logger.warn(`[IMAP] Timeout on attempt ${attempt}/${IMAP_MAX_RETRIES} for ${email} (connTimeout: ${Math.round(imapProfile.connTimeoutMs * timeoutMultiplier)}ms). Retrying with doubled timeout...`);
                 continue;
             }
-
-            logger.error(`[IMAP] Check failed for ${email} after attempt ${attempt}:`, error);
 
             return {
                 accountId,
@@ -1887,12 +1929,31 @@ async function imapPollingLoop() {
 
             // Process tasks and report each result immediately
             for (const task of data.tasks) {
+                const taskStart = Date.now();
+                logger.info(`[IMAP] Processing task ${data.tasks.indexOf(task) + 1}/${data.tasks.length}`, {
+                    accountId: task.accountId,
+                    email: task.email,
+                    host: task.imapConfig?.host,
+                    delaySeconds: task.delaySeconds
+                });
+
                 const result = await checkImap(task);
 
+                logger.info(`[IMAP] Task completed in ${Date.now() - taskStart}ms`, {
+                    accountId: result.accountId,
+                    email: result.email,
+                    success: result.success,
+                    emailCount: result.emails.length,
+                    errorMessage: result.errorMessage || null
+                });
+
                 // Report immediately after each task so results aren't lost on restart
+                logger.info(`[IMAP] Reporting result for ${result.email} (success=${result.success})...`);
                 const reportSuccess = await reportImap([result]);
-                if (!reportSuccess) {
-                    logger.warn(`[IMAP] Failed to report result for ${result.email}`);
+                if (reportSuccess) {
+                    logger.info(`[IMAP] Report accepted for ${result.email}`);
+                } else {
+                    logger.warn(`[IMAP] Failed to report result for ${result.email} after all retries`);
                 }
 
                 // Task interval delay (rate limiting: controls check frequency, avoids simultaneous IMAP connections)
