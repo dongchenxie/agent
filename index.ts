@@ -2171,14 +2171,21 @@ async function main() {
                 log(`[Agent] Queue size: ${currentQueue.length}`);
 
                 const results: TaskResult[] = [];
+                let failedReportCount = 0;
 
                 // Process tasks sequentially with delay
-                for (const task of tasks) {
+                for (const [taskIndex, task] of tasks.entries()) {
                     const result = await runExclusiveEmailSend(
                         `campaign queue item ${task.queueId}`,
                         () => sendEmail(task)
                     );
                     results.push(result);
+
+                    const reportSuccess = await report([result]);
+                    if (!reportSuccess) {
+                        failedReportCount++;
+                        logger.warn(`[Agent] Queue ${result.queueId} finished sending, but reporting to master failed after 5 retries`);
+                    }
 
                     // Remove from queue after processing
                     const index = currentQueue.indexOf(task);
@@ -2187,19 +2194,17 @@ async function main() {
                     }
 
                     // Delay between sends
-                    if (tasks.indexOf(task) < tasks.length - 1) {
+                    if (taskIndex < tasks.length - 1) {
                         await sleep(config.sendInterval);
                     }
                 }
 
-                // Report results with retry mechanism
-                const reportSuccess = await report(results);
                 isProcessing = false;
 
-                if (reportSuccess) {
+                if (failedReportCount === 0) {
                     log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful`);
                 } else {
-                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful, but failed to report to master after 5 retries`);
+                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful, but ${failedReportCount} result(s) failed to report to master after 5 retries`);
                 }
                 log(`[Agent] Queue size: ${currentQueue.length}`);
             }
