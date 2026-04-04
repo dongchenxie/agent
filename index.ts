@@ -13,6 +13,8 @@ import { updateChecker } from './update-checker';
 import { logger } from './logger';
 import { LogUploader } from './log-uploader';
 import packageJson from './package.json';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const VERSION = packageJson.version;
 
@@ -556,6 +558,106 @@ const AGENT_NICKNAME = process.env.AGENT_NICKNAME || `agent-${Date.now()}`;
 
 // Initialize logger
 logger.init();
+
+// --- Pending Results Persistence ---
+// Saves SMTP send results to disk so they survive process crashes.
+// On startup, any pending results are re-reported to the master.
+const PENDING_RESULTS_DIR = path.join(logger.getLogsDir(), 'pending-results');
+
+function ensurePendingResultsDir(): void {
+    if (!fs.existsSync(PENDING_RESULTS_DIR)) {
+        fs.mkdirSync(PENDING_RESULTS_DIR, { recursive: true });
+    }
+}
+
+function savePendingResult(result: { queueId: number; [key: string]: any }): string {
+    ensurePendingResultsDir();
+    const filename = `result-${result.queueId}-${Date.now()}.json`;
+    const filepath = path.join(PENDING_RESULTS_DIR, filename);
+    fs.writeFileSync(filepath, JSON.stringify(result), 'utf-8');
+    logger.info(`[PendingResults] Saved pending result for queue ${result.queueId} to ${filename}`);
+    return filepath;
+}
+
+function removePendingResult(filepath: string): void {
+    try {
+        if (fs.existsSync(filepath)) {
+            fs.unlinkSync(filepath);
+        }
+    } catch (error) {
+        logger.warn(`[PendingResults] Failed to remove ${filepath}:`, error);
+    }
+}
+
+function loadPendingResults(): { filepath: string; result: any }[] {
+    ensurePendingResultsDir();
+    const files = fs.readdirSync(PENDING_RESULTS_DIR).filter(f => f.endsWith('.json'));
+    const pending: { filepath: string; result: any }[] = [];
+    for (const file of files) {
+        const filepath = path.join(PENDING_RESULTS_DIR, file);
+        try {
+            const data = JSON.parse(fs.readFileSync(filepath, 'utf-8'));
+            pending.push({ filepath, result: data });
+        } catch (error) {
+            logger.warn(`[PendingResults] Failed to parse ${file}, removing:`, error);
+            removePendingResult(filepath);
+        }
+    }
+    return pending;
+}
+
+const PENDING_RESULTS_MAX_AGE_MS = 72 * 60 * 60 * 1000; // 72 hours
+
+async function retryPendingResults(): Promise<void> {
+    const pending = loadPendingResults();
+    if (pending.length === 0) return;
+
+    logger.info(`[PendingResults] Found ${pending.length} pending result(s) from previous run, retrying reports...`);
+
+    for (const { filepath, result } of pending) {
+        // Clean up stale files — after 72h the master has already timed out these items
+        try {
+            const stat = fs.statSync(filepath);
+            if (Date.now() - stat.mtimeMs > PENDING_RESULTS_MAX_AGE_MS) {
+                logger.info(`[PendingResults] Removing expired result for queue ${result.queueId} (older than 72h)`);
+                removePendingResult(filepath);
+                continue;
+            }
+        } catch {
+            // stat failed, file may have been removed concurrently
+            continue;
+        }
+
+        try {
+            const reportSuccess = await report([result]);
+            if (reportSuccess) {
+                logger.info(`[PendingResults] Successfully reported queue ${result.queueId} from previous run`);
+                removePendingResult(filepath);
+            } else {
+                logger.warn(`[PendingResults] Failed to report queue ${result.queueId}, will retry next startup`);
+            }
+        } catch (error) {
+            logger.warn(`[PendingResults] Error reporting queue ${result.queueId}:`, error);
+        }
+    }
+}
+
+// --- Global Error Handlers ---
+// Prevent uncaught exceptions and unhandled rejections from silently crashing the process.
+process.on('uncaughtException', (error: Error) => {
+    logger.error('[FATAL] Uncaught exception - process will continue but may be unstable:', error);
+    logger.error(`[FATAL] Stack: ${error.stack || 'no stack'}`);
+    // Don't exit - let the process continue so pending reports can still be sent.
+    // The process manager (systemd/docker) will restart if things go truly wrong.
+});
+
+process.on('unhandledRejection', (reason: any) => {
+    logger.error('[FATAL] Unhandled promise rejection:', reason);
+    if (reason instanceof Error) {
+        logger.error(`[FATAL] Stack: ${reason.stack || 'no stack'}`);
+    }
+    // Don't exit - same rationale as uncaughtException.
+});
 
 // Initialize log uploader
 const logUploader = new LogUploader(MASTER_URL, logger.getLogsDir());
@@ -1886,6 +1988,9 @@ async function healthCheckLoop() {
 }
 
 // IMAP polling loop - runs independently
+// IMPORTANT: This loop is fully isolated from the SMTP sending pipeline.
+// Any error here (connection hang, crash, timeout) must NEVER propagate
+// to the main process or affect email sending/reporting.
 async function imapPollingLoop() {
     log('[Agent] IMAP polling loop started');
 
@@ -1899,15 +2004,21 @@ async function imapPollingLoop() {
             }
 
             // Poll for IMAP tasks
-            const baseUrl = MASTER_URL.replace(/\/$/, '');
-            const response = await fetch(`${baseUrl}/api/agents/poll-imap`, {
-                method: 'GET',
-                headers: {
-                    'X-Agent-Token': agentToken,
-                    'X-Agent-Version': VERSION,
-                    'X-Custom-Agent': 'RankScaleAIEmailAgent'
-                }
-            });
+            let response: Response;
+            try {
+                const baseUrl = MASTER_URL.replace(/\/$/, '');
+                response = await fetch(`${baseUrl}/api/agents/poll-imap`, {
+                    method: 'GET',
+                    headers: {
+                        'X-Agent-Token': agentToken,
+                        'X-Agent-Version': VERSION,
+                        'X-Custom-Agent': 'RankScaleAIEmailAgent'
+                    }
+                });
+            } catch (fetchError) {
+                logger.warn('[IMAP] Poll fetch error (network issue, will retry next cycle):', fetchError);
+                continue;
+            }
 
             if (!response.ok) {
                 logger.warn(`[IMAP] Poll failed: ${response.status} ${response.statusText}`);
@@ -1928,44 +2039,56 @@ async function imapPollingLoop() {
             }
 
             // Process tasks and report each result immediately
-            for (const task of data.tasks) {
-                const taskStart = Date.now();
-                logger.info(`[IMAP] Processing task ${data.tasks.indexOf(task) + 1}/${data.tasks.length}`, {
-                    accountId: task.accountId,
-                    email: task.email,
-                    host: task.imapConfig?.host,
-                    delaySeconds: task.delaySeconds
-                });
+            // Each task is individually wrapped in try-catch so a single
+            // failing IMAP account cannot crash the loop or block other tasks.
+            for (const [taskIdx, task] of data.tasks.entries()) {
+                try {
+                    const taskStart = Date.now();
+                    logger.info(`[IMAP] Processing task ${taskIdx + 1}/${data.tasks.length}`, {
+                        accountId: task.accountId,
+                        email: task.email,
+                        host: task.imapConfig?.host,
+                        delaySeconds: task.delaySeconds
+                    });
 
-                const result = await checkImap(task);
+                    const result = await checkImap(task);
 
-                logger.info(`[IMAP] Task completed in ${Date.now() - taskStart}ms`, {
-                    accountId: result.accountId,
-                    email: result.email,
-                    success: result.success,
-                    emailCount: result.emails.length,
-                    errorMessage: result.errorMessage || null
-                });
+                    logger.info(`[IMAP] Task completed in ${Date.now() - taskStart}ms`, {
+                        accountId: result.accountId,
+                        email: result.email,
+                        success: result.success,
+                        emailCount: result.emails.length,
+                        errorMessage: result.errorMessage || null
+                    });
 
-                // Report immediately after each task so results aren't lost on restart
-                logger.info(`[IMAP] Reporting result for ${result.email} (success=${result.success})...`);
-                const reportSuccess = await reportImap([result]);
-                if (reportSuccess) {
-                    logger.info(`[IMAP] Report accepted for ${result.email}`);
-                } else {
-                    logger.warn(`[IMAP] Failed to report result for ${result.email} after all retries`);
+                    // Report immediately after each task so results aren't lost on restart
+                    logger.info(`[IMAP] Reporting result for ${result.email} (success=${result.success})...`);
+                    try {
+                        const reportSuccess = await reportImap([result]);
+                        if (reportSuccess) {
+                            logger.info(`[IMAP] Report accepted for ${result.email}`);
+                        } else {
+                            logger.warn(`[IMAP] Failed to report result for ${result.email} after all retries`);
+                        }
+                    } catch (reportError) {
+                        logger.error(`[IMAP] Report crashed for ${task.email}:`, reportError);
+                    }
+                } catch (taskError) {
+                    // Individual IMAP task failure - log and continue to next task
+                    logger.error(`[IMAP] Task failed for account ${task.accountId} (${task.email}), skipping:`, taskError);
                 }
 
-                // Task interval delay (rate limiting: controls check frequency, avoids simultaneous IMAP connections)
-                if (data.tasks.indexOf(task) < data.tasks.length - 1) {
+                // Task interval delay (rate limiting)
+                if (taskIdx < data.tasks.length - 1) {
                     logger.info(`[IMAP] Waiting ${config.sendInterval}ms before next check (rate limiting)`);
                     await sleep(config.sendInterval);
                 }
             }
 
         } catch (error) {
-            logger.error('[IMAP] Polling loop error:', error);
-            await sleep(60000); // Wait 1 minute on error
+            // Outer catch: protects against any unexpected error in the loop itself
+            logger.error('[IMAP] Polling loop error (will retry in 60s):', error);
+            await sleep(60000);
         }
     }
 }
@@ -2072,6 +2195,9 @@ async function main() {
     logUploader.setToken(agentToken);
     logUploader.start();
 
+    // Retry any pending results from previous crash
+    await retryPendingResults();
+
     // Start health check loop in background
     log(`[Agent] Starting health check loop (interval: ${config.healthCheckInterval}ms)...`);
     healthCheckLoop().catch(console.error);
@@ -2135,10 +2261,15 @@ async function main() {
                         () => sendEmail(task)
                     );
 
+                    // Persist to disk before reporting
+                    const pendingFile = savePendingResult(result);
+
                     // Report with retry mechanism
                     const reportSuccess = await report([result]);
-                    if (!reportSuccess) {
-                        logger.warn('[Agent] Failed to report result after 5 retries, but continuing with remaining queue');
+                    if (reportSuccess) {
+                        removePendingResult(pendingFile);
+                    } else {
+                        logger.warn('[Agent] Failed to report result after 5 retries, saved to disk for retry on next startup');
                     }
 
                     isProcessing = false;
@@ -2181,10 +2312,17 @@ async function main() {
                     );
                     results.push(result);
 
+                    // Persist result to disk BEFORE reporting to master.
+                    // If the process crashes after SMTP send but before report,
+                    // the result will be retried from disk on next startup.
+                    const pendingFile = savePendingResult(result);
+
                     const reportSuccess = await report([result]);
-                    if (!reportSuccess) {
+                    if (reportSuccess) {
+                        removePendingResult(pendingFile);
+                    } else {
                         failedReportCount++;
-                        logger.warn(`[Agent] Queue ${result.queueId} finished sending, but reporting to master failed after 5 retries`);
+                        logger.warn(`[Agent] Queue ${result.queueId} finished sending, but reporting to master failed after 5 retries. Result saved to disk for retry.`);
                     }
 
                     // Remove from queue after processing
@@ -2204,7 +2342,7 @@ async function main() {
                 if (failedReportCount === 0) {
                     log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful`);
                 } else {
-                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful, but ${failedReportCount} result(s) failed to report to master after 5 retries`);
+                    log(`[Agent] Completed ${results.length} task(s), ${results.filter(r => r.success).length} successful, but ${failedReportCount} result(s) failed to report to master (saved to disk)`);
                 }
                 log(`[Agent] Queue size: ${currentQueue.length}`);
             }
