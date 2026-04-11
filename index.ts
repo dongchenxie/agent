@@ -1776,7 +1776,7 @@ async function checkImapOnce(
                     totalMessages = results.length;
                     logger.info(`[IMAP] Found ${totalMessages} new messages for ${email}`);
 
-                    const fetch = imap.fetch(results, { bodies: '', markSeen: false });
+                    const fetch = imap.fetch(results, { bodies: '', markSeen: true });
                     const messageProcessingPromises: Array<Promise<void>> = [];
 
                     fetch.on('message', (msg: any, seqno: number) => {
