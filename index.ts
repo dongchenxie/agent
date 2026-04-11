@@ -1657,8 +1657,12 @@ function isImapTimeoutError(error: unknown): boolean {
     return false;
 }
 
-// Single IMAP connection attempt with configurable timeout multiplier
-// IMAP receive is a background task — no human-like delays needed (unlike SMTP send).
+// Single IMAP connection attempt with configurable timeout multiplier.
+// Applies the full ImapClientProfile fingerprint so that IMAP connections are
+// symmetric with SMTP (same stable client identity per email address) and
+// look like a real human using a mail client: send IMAP ID, pause between
+// every protocol step (openBox/search/fetch/logout), and keep the connection
+// alive with profile-driven NOOP/IDLE intervals.
 async function checkImapOnce(
     task: ImapTask,
     imapProfile: ImapClientProfile,
@@ -1677,7 +1681,12 @@ async function checkImapOnce(
             connTimeout, authTimeout, socketTimeout,
             timeoutMultiplier,
             tls: imapConfig.secure,
-            servername: imapProfile.tlsServername
+            servername: imapProfile.tlsServername,
+            clientFamily: imapProfile.clientFamily,
+            deviceName: imapProfile.deviceName,
+            keepaliveIntervalMs: imapProfile.keepaliveIntervalMs,
+            idleIntervalMs: imapProfile.idleIntervalMs,
+            forceNoop: imapProfile.forceNoop
         });
 
         const imapConnectionConfig: any = {
@@ -1695,6 +1704,12 @@ async function checkImapOnce(
             connTimeout,
             authTimeout,
             socketTimeout,
+            // Human-like keepalive: profile-driven NOOP interval and IDLE re-issue cadence
+            keepalive: {
+                interval: imapProfile.keepaliveIntervalMs,
+                idleInterval: imapProfile.idleIntervalMs,
+                forceNoop: imapProfile.forceNoop
+            }
         };
         const imap = new Imap(imapConnectionConfig);
 
@@ -1734,8 +1749,14 @@ async function checkImapOnce(
             }
         };
 
-        // Hard timeout: if the entire operation takes too long, force resolve
-        const hardTimeoutMs = connTimeout + 15000; // connTimeout + 15s buffer
+        // Hard timeout: connTimeout + worst-case sum of all human-like delays + 20s for real work.
+        // Worst-case delay chain: postHandshake + postOpenBox + postSearch + postFetch.
+        const maxPostDelaysMs =
+            imapProfile.postHandshakeDelayMaxMs +
+            imapProfile.postOpenBoxDelayMaxMs +
+            imapProfile.postSearchDelayMaxMs +
+            imapProfile.postFetchDelayMaxMs;
+        const hardTimeoutMs = connTimeout + maxPostDelaysMs + 20000;
         const hardTimer = setTimeout(() => {
             logger.warn(`[IMAP] Hard timeout after ${hardTimeoutMs}ms for ${email}`, { accountId });
             try { imap.destroy(); } catch (_) {}
@@ -1746,115 +1767,166 @@ async function checkImapOnce(
             const handshakeMs = getDurationMs(connectStart);
             logger.info('[IMAP] Connected:', { accountId, email, handshakeMs });
 
-            imap.openBox('INBOX', false, (err: any, box: any) => {
-                if (err) {
-                    endConnection();
-                    rejectOnce(err instanceof Error ? err : new Error(String(err)));
-                    return;
+            // Step 1: send IMAP ID (RFC 2971) so the server sees a real client identity
+            // Step 2: pause like a human after handshake
+            // Step 3: openBox / search / fetch, each separated by a profile-driven pause
+            void (async () => {
+                try {
+                    await sendImapIdentification(imap, imapProfile, { accountId, email, host: imapConfig.host });
+                } catch (idError) {
+                    logger.warn('[IMAP] sendImapIdentification threw:', {
+                        accountId, email,
+                        error: idError instanceof Error ? idError.message : String(idError)
+                    });
                 }
 
-                logger.info('[IMAP] INBOX opened:', {
-                    accountId, email,
-                    total: box?.messages?.total,
-                    unseen: box?.messages?.unseen
-                });
+                const postHandshakeDelayMs = getRandomDelayMs(
+                    imapProfile.postHandshakeDelayMinMs,
+                    imapProfile.postHandshakeDelayMaxMs
+                );
+                logger.info('[IMAP] Post-handshake delay', { accountId, email, postHandshakeDelayMs });
+                await sleep(postHandshakeDelayMs);
 
-                imap.search(['UNSEEN'], (searchError: any, results: number[] | undefined) => {
-                    if (searchError) {
+                if (settled) return;
+
+                imap.openBox('INBOX', false, (err: any, box: any) => {
+                    if (err) {
                         endConnection();
-                        rejectOnce(searchError instanceof Error ? searchError : new Error(String(searchError)));
+                        rejectOnce(err instanceof Error ? err : new Error(String(err)));
                         return;
                     }
 
-                    if (!results || results.length === 0) {
-                        logger.info(`[IMAP] No new messages for ${email}`);
-                        resolveOnce(fetchedEmails);
-                        endConnection();
-                        return;
-                    }
-
-                    totalMessages = results.length;
-                    logger.info(`[IMAP] Found ${totalMessages} new messages for ${email}`);
-
-                    const fetch = imap.fetch(results, { bodies: '', markSeen: true });
-                    const messageProcessingPromises: Array<Promise<void>> = [];
-
-                    fetch.on('message', (msg: any, seqno: number) => {
-                        const messageProcessing = new Promise<void>((resolveMessage) => {
-                            let bodyProcessed = false;
-
-                            msg.on('body', (stream: any) => {
-                                bodyProcessed = true;
-
-                                const parsePromise = (async () => {
-                                    try {
-                                        const parsed: any = await simpleParser(stream);
-                                        const fromAddress = parsed.from?.value?.[0];
-                                        const toAddress = parsed.to?.value?.[0];
-
-                                        const receivedEmail: ReceivedEmail = {
-                                            messageId: parsed.messageId || `generated-${Date.now()}-${seqno}`,
-                                            from: {
-                                                email: fromAddress?.address || 'unknown@unknown.com',
-                                                name: fromAddress?.name
-                                            },
-                                            to: toAddress?.address || '',
-                                            subject: parsed.subject || '(No Subject)',
-                                            textBody: parsed.text,
-                                            htmlBody: parsed.html ? String(parsed.html) : undefined,
-                                            receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString()
-                                        };
-
-                                        fetchedEmails.push(receivedEmail);
-                                        logger.info(`[IMAP] Parsed email: ${receivedEmail.subject} from ${receivedEmail.from.email}`);
-                                    } catch (error) {
-                                        logger.error(`[IMAP] Error processing email ${seqno}:`, error);
-                                    } finally {
-                                        processedCount++;
-                                        resolveMessage();
-                                    }
-                                })();
-
-                                void parsePromise;
-                            });
-
-                            msg.once('end', () => {
-                                if (!bodyProcessed) {
-                                    processedCount++;
-                                    resolveMessage();
-                                }
-                            });
-                        });
-
-                        messageProcessingPromises.push(messageProcessing);
+                    logger.info('[IMAP] INBOX opened:', {
+                        accountId, email,
+                        total: box?.messages?.total,
+                        unseen: box?.messages?.unseen
                     });
 
-                    fetch.once('error', (fetchError: any) => {
-                        logger.error('[IMAP] Fetch error:', fetchError);
-                        fetch.removeAllListeners();
-                        endConnection();
-                        rejectOnce(fetchError instanceof Error ? fetchError : new Error(String(fetchError)));
-                    });
+                    const postOpenBoxDelayMs = getRandomDelayMs(
+                        imapProfile.postOpenBoxDelayMinMs,
+                        imapProfile.postOpenBoxDelayMaxMs
+                    );
+                    setTimeout(() => {
+                        if (settled) return;
 
-                    fetch.once('end', () => {
-                        void (async () => {
-                            await Promise.allSettled(messageProcessingPromises);
-                            logger.info(`[IMAP] Fetch completed. Processed ${processedCount}/${totalMessages} messages`);
-                            fetch.removeAllListeners();
-                            resolveOnce(fetchedEmails);
-                            endConnection();
-                        })().catch((fetchEndError) => {
-                            resolveOnce(fetchedEmails);
-                            endConnection();
-                            rejectOnce(
-                                fetchEndError instanceof Error
-                                    ? fetchEndError
-                                    : new Error(String(fetchEndError))
+                        imap.search(['UNSEEN'], (searchError: any, results: number[] | undefined) => {
+                            if (searchError) {
+                                endConnection();
+                                rejectOnce(searchError instanceof Error ? searchError : new Error(String(searchError)));
+                                return;
+                            }
+
+                            const postSearchDelayMs = getRandomDelayMs(
+                                imapProfile.postSearchDelayMinMs,
+                                imapProfile.postSearchDelayMaxMs
                             );
+
+                            if (!results || results.length === 0) {
+                                logger.info(`[IMAP] No new messages for ${email}`, { postSearchDelayMs });
+                                // Even on empty results, pause briefly before LOGOUT —
+                                // a real client wouldn't disconnect the instant SEARCH returns 0.
+                                setTimeout(() => {
+                                    resolveOnce(fetchedEmails);
+                                    endConnection();
+                                }, postSearchDelayMs);
+                                return;
+                            }
+
+                            totalMessages = results.length;
+                            logger.info(`[IMAP] Found ${totalMessages} new messages for ${email}`, { postSearchDelayMs });
+
+                            setTimeout(() => {
+                                if (settled) return;
+
+                                const fetch = imap.fetch(results, { bodies: '', markSeen: true });
+                                const messageProcessingPromises: Array<Promise<void>> = [];
+
+                                fetch.on('message', (msg: any, seqno: number) => {
+                                    const messageProcessing = new Promise<void>((resolveMessage) => {
+                                        let bodyProcessed = false;
+
+                                        msg.on('body', (stream: any) => {
+                                            bodyProcessed = true;
+
+                                            const parsePromise = (async () => {
+                                                try {
+                                                    const parsed: any = await simpleParser(stream);
+                                                    const fromAddress = parsed.from?.value?.[0];
+                                                    const toAddress = parsed.to?.value?.[0];
+
+                                                    const receivedEmail: ReceivedEmail = {
+                                                        messageId: parsed.messageId || `generated-${Date.now()}-${seqno}`,
+                                                        from: {
+                                                            email: fromAddress?.address || 'unknown@unknown.com',
+                                                            name: fromAddress?.name
+                                                        },
+                                                        to: toAddress?.address || '',
+                                                        subject: parsed.subject || '(No Subject)',
+                                                        textBody: parsed.text,
+                                                        htmlBody: parsed.html ? String(parsed.html) : undefined,
+                                                        receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString()
+                                                    };
+
+                                                    fetchedEmails.push(receivedEmail);
+                                                    logger.info(`[IMAP] Parsed email: ${receivedEmail.subject} from ${receivedEmail.from.email}`);
+                                                } catch (error) {
+                                                    logger.error(`[IMAP] Error processing email ${seqno}:`, error);
+                                                } finally {
+                                                    processedCount++;
+                                                    resolveMessage();
+                                                }
+                                            })();
+
+                                            void parsePromise;
+                                        });
+
+                                        msg.once('end', () => {
+                                            if (!bodyProcessed) {
+                                                processedCount++;
+                                                resolveMessage();
+                                            }
+                                        });
+                                    });
+
+                                    messageProcessingPromises.push(messageProcessing);
+                                });
+
+                                fetch.once('error', (fetchError: any) => {
+                                    logger.error('[IMAP] Fetch error:', fetchError);
+                                    fetch.removeAllListeners();
+                                    endConnection();
+                                    rejectOnce(fetchError instanceof Error ? fetchError : new Error(String(fetchError)));
+                                });
+
+                                fetch.once('end', () => {
+                                    void (async () => {
+                                        await Promise.allSettled(messageProcessingPromises);
+                                        logger.info(`[IMAP] Fetch completed. Processed ${processedCount}/${totalMessages} messages`);
+                                        fetch.removeAllListeners();
+
+                                        // Human-like pause after reading all messages, before LOGOUT
+                                        await randomDelay(
+                                            imapProfile.postFetchDelayMinMs,
+                                            imapProfile.postFetchDelayMaxMs
+                                        );
+
+                                        resolveOnce(fetchedEmails);
+                                        endConnection();
+                                    })().catch((fetchEndError) => {
+                                        resolveOnce(fetchedEmails);
+                                        endConnection();
+                                        rejectOnce(
+                                            fetchEndError instanceof Error
+                                                ? fetchEndError
+                                                : new Error(String(fetchEndError))
+                                        );
+                                    });
+                                });
+                            }, postSearchDelayMs);
                         });
-                    });
+                    }, postOpenBoxDelayMs);
                 });
-            });
+            })();
         });
 
         imap.once('error', (err: any) => {
